@@ -1,0 +1,9 @@
+.git
+.env*
+data
+artifacts
+__pycache__
+*.sqlite*
+*.npz
+tests
+upload

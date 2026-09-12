@@ -42,9 +42,8 @@ Status: executable research implementation; exchange demo activation blocked.
 11. Explanations report model probabilities and local feature-ablation effects.
     These are sensitivity measurements, not causal reasons, literal model
     weights, calibrated win probabilities or fabricated narratives.
-12. GitHub creation is unavailable in this session. Do not reuse unrelated repos.
-    Provide a complete source archive and local commit history until a new
-    user-owned repository exists. Railway configuration is included, but a config
+12. The user created `sjdpluse/babayaga` for this project. Publish staged commits
+    there and do not reuse unrelated repositories. Railway configuration is included, but a config
     file alone does not enable GitHub autodeploy or provision credentials.
 
 ## Primary sources checked
