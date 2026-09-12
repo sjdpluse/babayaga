@@ -55,6 +55,10 @@ is read from process environment variables, not automatically from a `.env` file
 Set the API key and secret in environment variables or Railway Variables. Never
 paste keys into source, issues, commits or logs.
 
+On Railway, adding both exchange credentials and redeploying automatically runs
+the same connection preflight, including in research mode. Inspect the redacted
+`connection_preflight` entry in deployment logs. This does not unlock orders.
+
 ```bash
 python -m scripts.check_connection
 ```

@@ -48,6 +48,20 @@ class PipelineTests(unittest.TestCase):
 
 
 class AsyncPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_research_worker_checks_connection_when_keys_are_added(self):
+        from unittest.mock import AsyncMock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            settings=Settings(api_key="TEST_ONLY",api_secret="TEST_ONLY",state_dir=tmp)
+            worker=Worker(settings)
+            try:
+                with patch("scripts.check_connection.check",new_callable=AsyncMock) as check:
+                    check.return_value={"profile":"ok","futures_markets":"ok","exchange_writes_enabled":False}
+                    result=await worker.run(once=True)
+                    check.assert_awaited_once_with(settings)
+                    self.assertEqual(result["trading"],"blocked")
+                    self.assertEqual(result["connection"]["profile"],"ok")
+            finally: worker.journal.close()
+
     async def test_collector_with_explicit_fixture_contract(self):
         c=candles(600)
         m=market()

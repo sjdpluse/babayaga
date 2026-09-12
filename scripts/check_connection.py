@@ -4,8 +4,8 @@ from truetrade.config import Settings
 from truetrade.exchange.client import ExchangeClient, ExchangeError
 
 
-async def check():
-    client = ExchangeClient(Settings.from_env())
+async def check(settings=None):
+    client = ExchangeClient(settings or Settings.from_env())
     # First authenticated call always profile. 403 can indicate missing optional
     # readonly scope: that does not establish the futures scope is invalid.
     result = {"demo_routing_verified": False, "exchange_writes_enabled": False}

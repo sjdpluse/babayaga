@@ -8,7 +8,7 @@ from pathlib import Path
 import signal
 import time
 from truetrade.config import Settings
-from truetrade.exchange.client import DemoContractUnverified, ExchangeClient
+from truetrade.exchange.client import DemoContractUnverified, ExchangeClient, ExchangeError
 from truetrade.exchange.collector import collect
 from truetrade.persistence.store import Journal, SupabaseSink
 
@@ -44,10 +44,18 @@ class Worker:
     async def run(self, once=False):
         if self.settings.mode == "demo":
             raise DemoContractUnverified("Demo exchange adapter is unverified; this release does not send orders")
-        if self.settings.mode == "collect":
+        if self.settings.api_key and self.settings.api_secret:
             from scripts.check_connection import check
-            preflight = await check()
-            if preflight.get("futures_markets") != "ok": raise ValueError("Connection preflight failed")
+            try:
+                preflight = await check(self.settings)
+                self.state["connection"] = preflight
+            except (ValueError, ExchangeError) as error:
+                self.state["connection"] = {"status":"blocked", "reason":str(error)}
+            print(json.dumps({"connection_preflight":self.state["connection"]}),flush=True)
+        else:
+            self.state["connection"] = {"status":"credentials_not_configured"}
+        if self.settings.mode == "collect" and self.state["connection"].get("futures_markets") != "ok":
+            raise ValueError("Connection preflight failed; inspect the redacted startup diagnostic")
         sink = SupabaseSink(self.settings.supabase_url,self.settings.supabase_key) if self.settings.supabase_url and self.settings.supabase_key else None
         next_capture = 0.
         capture_interval = max(60, int(os.getenv("COLLECT_INTERVAL_SECONDS","3600")))
