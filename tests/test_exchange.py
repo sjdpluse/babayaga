@@ -57,6 +57,33 @@ class ExchangeTests(unittest.IsolatedAsyncioTestCase):
                 await client.request(method, "/futures/positions", body={"walletType":"debit"})
         self.assertEqual(t.requests, [])
 
+    async def test_html_forbidden_metadata_does_not_echo_secrets_or_retry(self):
+        client, t = self.client([Response(403, {
+            "Content-Type": "text/html; TEST_SECRET", "Server": "cloudflare",
+            "CF-Ray": "TEST_SECRET", "CF-Mitigated": "challenge",
+        }, b'<!DOCTYPE html><html>TEST_KEY TEST_SECRET</html>')])
+        with self.assertRaises(ExchangeError) as caught:
+            await client.profile()
+        details = caught.exception.diagnostic()
+        self.assertEqual(details["response"]["body_kind"], "html")
+        self.assertEqual(details["response"]["content_type"], "text/html")
+        self.assertTrue(details["response"]["challenge_header_present"])
+        self.assertEqual(details["response"]["endpoint"], "/users/profile")
+        self.assertNotIn("TEST_KEY", json.dumps(details))
+        self.assertNotIn("TEST_SECRET", json.dumps(details))
+        self.assertEqual(len(t.requests), 1)
+
+    async def test_unknown_headers_are_not_logged(self):
+        client, _ = self.client([Response(403, {
+            "Content-Type": "TEST_SECRET", "Server": "TEST_KEY",
+        }, b'')])
+        with self.assertRaises(ExchangeError) as caught:
+            await client.markets()
+        raw = json.dumps(caught.exception.diagnostic())
+        self.assertNotIn("TEST_SECRET", raw)
+        self.assertNotIn("TEST_KEY", raw)
+        self.assertEqual(caught.exception.metadata["body_kind"], "empty")
+
     async def test_transfer_read_disallowed(self):
         client, t = self.client([])
         with self.assertRaises(ValueError): await client.request("GET", "/accounting/transfer")

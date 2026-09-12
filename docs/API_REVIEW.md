@@ -29,3 +29,12 @@ The logging fix adds a message containing the sanitized status summary, retains
 structured details, and explicitly logs missing credentials. It changes no signing
 rules or exchange write permissions. Check the new deployment's connection_preflight
 line before diagnosing the key, signature, allowlist or scope.
+
+The subsequent JSON export (`logs.1789205950975.json`) shows a running research
+worker and an HTTP 403 response that could not be parsed as JSON. This does not
+identify the rejecting layer or establish whether credentials are valid.
+Preflight now retains profile and markets failures separately, with safe response
+classifications (content type, HTML/empty body, size and recognized server/header
+indicators). No response body, arbitrary header values or credentials are logged.
+These indicators are diagnostic hints, not proof of the rejection's cause.
+After deploying this change, inspect the new `connection_preflight` entry.

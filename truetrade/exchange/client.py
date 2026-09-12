@@ -32,10 +32,15 @@ def signature(secret: str, timestamp_ms: int, method: str, uri: str) -> str:
 
 
 class ExchangeError(RuntimeError):
-    def __init__(self, status: int, codes: tuple[str, ...], action: str):
+    def __init__(self, status: int, codes: tuple[str, ...], action: str, metadata=None):
         self.status, self.codes, self.action = status, codes, action
+        self.metadata = metadata or {}
         # Never echo response body, request headers, raw URL or exception from a transport.
         super().__init__(f"Exchange HTTP {status}; codes={','.join(codes)}; action={action}")
+
+    def diagnostic(self):
+        return {"status": self.status, "codes": self.codes, "action": self.action,
+                "response": self.metadata}
 
 
 class DemoContractUnverified(RuntimeError):
@@ -47,6 +52,27 @@ class Response:
     status: int
     headers: dict
     body: bytes
+
+
+def response_metadata(response, path):
+    """Only finite labels/counts: never export arbitrary headers or error pages."""
+    headers = {k.lower(): v for k, v in response.headers.items()}
+    content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    server = headers.get("server", "").strip().lower()
+    prefix = response.body[:256].lstrip().lower()
+    return {
+        "endpoint": path if path in READ_PATHS else "other",
+        "content_type": content_type if content_type in {
+            "application/json", "text/html", "text/plain", "application/problem+json"
+        } else "other_or_missing",
+        "body_kind": "empty" if not response.body else (
+            "html" if prefix.startswith((b"<!doctype html", b"<html")) else "other"),
+        "body_bytes": len(response.body),
+        "server": server if server in {"cloudflare", "nginx", "envoy", "awselb/2.0"}
+                  else "other_or_missing",
+        "cloudflare_header_present": "cf-ray" in headers,
+        "challenge_header_present": headers.get("cf-mitigated", "").lower() == "challenge",
+    }
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -131,14 +157,17 @@ class ExchangeClient:
             try:
                 payload = json.loads(response.body)
             except (ValueError, UnicodeError):
-                raise ExchangeError(response.status, (), "invalid_json") from None
+                raise ExchangeError(response.status, (), "invalid_json",
+                                    response_metadata(response, path)) from None
             if not 200 <= response.status < 300:
                 errors = payload.get("errors", []) if isinstance(payload, dict) else []
                 codes = tuple(e.get("code", "") for e in errors if isinstance(e, dict)
                               and re.fullmatch(r"E_[A-Z0-9_]{1,100}", str(e.get("code", ""))))
                 action = {401: "check_allowlist_key_clock_then_signature", 403: "check_allowlist_scopes_and_key_active",
                           422: "reject_order_no_retry", 429: "cooldown_required"}.get(response.status, "halt_and_inspect_contract")
-                raise ExchangeError(response.status, codes, action)
+                metadata = response_metadata(response, path)
+                metadata["body_kind"] = "json"
+                raise ExchangeError(response.status, codes, action, metadata)
             date = {k.lower(): v for k, v in response.headers.items()}.get("date")
             if date:
                 try:

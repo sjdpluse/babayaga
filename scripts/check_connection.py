@@ -1,5 +1,4 @@
 import asyncio
-import json
 from truetrade.config import Settings
 from truetrade.exchange.client import ExchangeClient, ExchangeError
 from truetrade.diagnostics import emit
@@ -14,10 +13,15 @@ async def check(settings=None):
         await client.profile()
         result["profile"] = "ok"
     except ExchangeError as e:
-        result["profile"] = {"status":e.status,"codes":e.codes,"action":e.action}
-        if e.status != 403: return result
-    await client.markets()
-    result["futures_markets"] = "ok"
+        result["profile"] = e.diagnostic()
+        if e.status != 403:
+            result["futures_markets"] = "skipped_after_profile_failure"
+            return result
+    try:
+        await client.markets()
+        result["futures_markets"] = "ok"
+    except ExchangeError as e:
+        result["futures_markets"] = e.diagnostic()
     return result
 
 
