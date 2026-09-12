@@ -2,6 +2,7 @@ import asyncio
 import json
 from truetrade.config import Settings
 from truetrade.exchange.client import ExchangeClient, ExchangeError
+from truetrade.diagnostics import emit
 
 
 async def check(settings=None):
@@ -24,9 +25,9 @@ def main():
     try:
         result = asyncio.run(check())
     except (ValueError, ExchangeError) as e:
-        print(json.dumps({"connection":"blocked", "reason":str(e)}, ensure_ascii=False))
+        emit("connection_preflight", {"connection":"blocked", "reason":str(e)})
         raise SystemExit(2) from None
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    emit("connection_preflight", result)
     if result.get("futures_markets") != "ok": raise SystemExit(2)
 
 

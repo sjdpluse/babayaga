@@ -2,12 +2,12 @@
 import argparse
 import asyncio
 import json
-import logging
 import os
 from pathlib import Path
 import signal
 import time
 from truetrade.config import Settings
+from truetrade.diagnostics import emit
 from truetrade.exchange.client import DemoContractUnverified, ExchangeClient, ExchangeError
 from truetrade.exchange.collector import collect
 from truetrade.persistence.store import Journal, SupabaseSink
@@ -51,9 +51,9 @@ class Worker:
                 self.state["connection"] = preflight
             except (ValueError, ExchangeError) as error:
                 self.state["connection"] = {"status":"blocked", "reason":str(error)}
-            print(json.dumps({"connection_preflight":self.state["connection"]}),flush=True)
         else:
             self.state["connection"] = {"status":"credentials_not_configured"}
+        emit("connection_preflight", self.state["connection"])
         if self.settings.mode == "collect" and self.state["connection"].get("futures_markets") != "ok":
             raise ValueError("Connection preflight failed; inspect the redacted startup diagnostic")
         sink = SupabaseSink(self.settings.supabase_url,self.settings.supabase_key) if self.settings.supabase_url and self.settings.supabase_key else None
@@ -101,7 +101,7 @@ async def serve(once=False):
     try:
         if not once:
             server = await asyncio.start_server(worker.handle_http,"0.0.0.0",int(os.getenv("PORT","8080")),limit=4096)
-        print(json.dumps(worker.state),flush=True)
+        emit("worker_start", worker.state)
         return await worker.run(once)
     finally:
         if server:
@@ -121,7 +121,7 @@ def main():
         return
     try: asyncio.run(serve(a.once))
     except (ValueError,DemoContractUnverified) as e:
-        print(json.dumps({"status":"blocked","reason":str(e)},ensure_ascii=False),flush=True)
+        emit("worker_blocked", {"status":"blocked","reason":str(e)})
         raise SystemExit(2) from None
 
 
