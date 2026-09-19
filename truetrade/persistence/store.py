@@ -22,6 +22,7 @@ class Journal:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS execution_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS intents (
           id TEXT PRIMARY KEY, state TEXT NOT NULL, position_id TEXT, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS events (
@@ -31,6 +32,24 @@ class Journal:
           seq INTEGER PRIMARY KEY, intent_id TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL);
         """)
         self.db.commit()
+
+    def meta(self, key):
+        row = self.db.execute("SELECT value FROM execution_meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key, value):
+        with self.db:
+            self.db.execute("INSERT INTO execution_meta(key,value) VALUES (?,?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+    def bind_broker(self, identity):
+        old = self.meta("broker_identity")
+        if old and old != identity:
+            raise ValueError("Journal belongs to another broker/account/mode")
+        if not old:
+            if identity != "paper" and self.db.execute("SELECT 1 FROM intents LIMIT 1").fetchone():
+                raise ValueError("Legacy journal cannot be rebound to a trading account")
+            self.set_meta("broker_identity", identity)
 
     def create_intent(self, intent_id, payload):
         encoded = json.dumps(payload, sort_keys=True, allow_nan=False, default=str)

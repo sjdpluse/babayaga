@@ -5,15 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "truetrade-rl-bot"
 version = "0.1.0"
-description = "Demo-only TheTrueTrade RL research and execution system"
+description = "Babayaga research core and broker-neutral protected execution"
 requires-python = ">=3.11"
 dependencies = ["numpy>=1.24,<3"]
 
 [project.optional-dependencies]
 gym = ["gymnasium>=1.0,<2"]
+mt5 = ["MetaTrader5>=5.0,<6; sys_platform == 'win32'"]
 
 [project.scripts]
 truetrade = "truetrade.main:main"
+babayaga-mt5-agent = "truetrade.execution.agent:main"
 
 [tool.setuptools.packages.find]
 include = ["truetrade*", "scripts*"]
