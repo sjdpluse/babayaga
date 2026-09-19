@@ -60,6 +60,10 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError): self.journal.create_intent("x", {"amount":2})
         with self.assertRaises(ValueError): self.journal.transition("x", "protected")
 
-    def test_nonpaper_broker_rejected(self):
+    async def test_paper_cannot_authorize_nonpaper_execution(self):
+        from truetrade.brokers.base import OrderRejected
         broker = PaperBroker(account()); broker.kind = "demo"
-        with self.assertRaises(ExecutionHalted): ExecutionEngine(broker, RiskManager(), self.journal)
+        engine = ExecutionEngine(broker, RiskManager(), self.journal)
+        with self.assertRaises(OrderRejected):
+            await engine.open("blocked", market(), "LONG", 100, .3, .9)
+        self.assertEqual(broker.positions, {})

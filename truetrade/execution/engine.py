@@ -1,112 +1,149 @@
-"""Execution state machine. Only a paper broker is supplied in this release.
-
-An exchange demo broker must prove server-side account isolation before integration.
-Timeouts on writes are UNKNOWN, never blindly retried. TP/SL are included on entry,
-then patched and read back. Unknown outcomes block the next order, also on restart.
-"""
+"""Broker-neutral execution with durable deduplication and persistent halt latch."""
 import asyncio
 import json
 from dataclasses import asdict
-from truetrade.risk.manager import RiskRejected
+from types import SimpleNamespace
+from truetrade.brokers.base import Broker, OrderRejected, OrderUncertain
+from truetrade.brokers.paper import PaperBroker  # Backwards-compatible import.
+from truetrade.risk.manager import decimal as D
 
 
-class ExecutionHalted(RuntimeError): pass
+class ExecutionHalted(RuntimeError):
+    pass
 
 
 class ExecutionEngine:
-    def __init__(self, broker, risk, journal):
-        if broker.kind != "paper":
-            raise ExecutionHalted("No verified exchange demo broker exists in this release")
+    def __init__(self, broker: Broker, risk, journal):
+        if not isinstance(broker, Broker):
+            raise ExecutionHalted("Broker lacks the execution safety contract")
         self.broker, self.risk, self.journal = broker, risk, journal
         self.lock = asyncio.Lock()
+        self.journal.bind_broker(broker.identity)
+
+    def _halt(self, reason):
+        self.journal.set_meta("execution_halt", reason)
 
     async def open(self, decision_id, market, side, entry, atr, confidence, tier=1., leverage=20):
+        """Legacy paper/crypto entry point; preserve strategy and risk behavior."""
+        request = {"market": asdict(market), "side": side, "entry": entry, "atr": atr,
+                   "confidence": confidence, "tier": tier, "leverage": leverage}
+        async def prepare():
+            account = await self.broker.account()
+            return self.risk.size(market, account, side, entry, atr, confidence, tier, leverage)
+        return await self._execute(decision_id, request, prepare)
+
+    async def submit(self, signal):
+        async def prepare():
+            signal.validate_time()
+            return await self.broker.prepare(signal, self.risk.limits)
+        return await self._execute(signal.decision_id, asdict(signal), prepare)
+
+    async def _execute(self, decision_id, request, prepare):
         async with self.lock:
-            request = {"market": asdict(market), "side": side, "entry": entry, "atr": atr,
-                       "confidence": confidence, "tier": tier, "leverage": leverage}
-            encoded_request = json.dumps(request, sort_keys=True, default=str, allow_nan=False)
-            existing = self.journal.db.execute("SELECT state,payload FROM intents WHERE id=?", (decision_id,)).fetchone()
-            if existing:
-                if json.loads(existing[1])["request"] != encoded_request:
+            encoded = json.dumps(request, sort_keys=True, default=str, allow_nan=False)
+            old = self.journal.db.execute("SELECT state,payload FROM intents WHERE id=?", (decision_id,)).fetchone()
+            if old:
+                if json.loads(old[1])["request"] != encoded:
                     raise ValueError("Decision ID reused with a different requested action")
-                if existing[0] in {"intent", "submitted", "unknown"}:
+                if old[0] in {"intent", "submitted", "unknown"}:
                     raise ExecutionHalted("Existing decision outcome is unsettled")
                 return {"result": "duplicate_suppressed", "decision_id": decision_id}
-            if self.journal.unsettled():
-                raise ExecutionHalted("Unsettled execution intent: reconcile before new orders")
-            account = await self.broker.account()
-            plan = self.risk.size(market, account, side, entry, atr, confidence, tier, leverage)
-            payload = {"request": encoded_request, "plan": asdict(plan)}
+            if self.journal.meta("execution_halt") or self.journal.unsettled():
+                raise ExecutionHalted("Execution halted; reconciliation required")
+            await self.broker.assert_execution_allowed()
+            await self._audit_protected()
+            plan = await prepare()
+            payload = {"request": encoded, "plan": asdict(plan)}
             if not self.journal.create_intent(decision_id, payload):
-                return {"result": "duplicate_suppressed", "decision_id": decision_id}
+                raise ExecutionHalted("Concurrent submission requires reconciliation")
             try:
-                # Broker must atomically attach stop and target to entry.
                 result = await self.broker.open(plan)
-                position_id = result["positionId"]
-                if not isinstance(position_id, str) or not position_id:
-                    raise ValueError("Missing position identity")
-            except Exception:
-                self.journal.transition(decision_id, "unknown")
+                pid = result["positionId"]
+                if not isinstance(pid, str) or not pid:
+                    raise OrderUncertain("Missing position identity")
+            except OrderRejected:
+                self.journal.transition(decision_id, "rejected")
+                raise
+            except BaseException as error:
+                pid = getattr(error, "position_id", None)
+                self.journal.transition(decision_id, "unknown", pid)
+                self._halt("Order outcome unknown")
+                self.journal.append("trades", {"intent_id": decision_id, "status": "unknown",
+                                               "receipt": getattr(error, "receipt", {})})
+                if pid:
+                    await self._emergency_close(decision_id, pid)
                 raise ExecutionHalted("Order outcome unknown; no automatic resubmission") from None
-            self.journal.transition(decision_id, "submitted", position_id)
+            self.journal.transition(decision_id, "submitted", pid)
             try:
-                await self.broker.set_protection(position_id, plan.stop, plan.take_profit)
-                observed = await self.broker.position(position_id)
-                if observed["stop"] != plan.stop or observed["take_profit"] != plan.take_profit:
-                    raise ValueError("Protection mismatch")
-                if observed["size"] != plan.size or observed["entry"] != plan.entry:
-                    raise ValueError("Actual fill differs; fresh risk assessment required")
+                await self.broker.set_protection(pid, plan.stop, plan.take_profit)
+                observed = await self.broker.position(pid)
+                await self.broker.verify(plan, observed)
+            except BaseException:
+                self.journal.transition(decision_id, "unknown", pid)
+                self._halt("Protection or fill not verified")
+                await self._emergency_close(decision_id, pid)
+                raise ExecutionHalted("Protection/fill unverified; emergency close attempted; reconcile required") from None
+            self.journal.transition(decision_id, "protected", pid)
+            self.journal.append("trades", {"intent_id": decision_id, "position_id": pid,
+                                           "status": "protected", "plan": asdict(plan),
+                                           "observed": observed, "receipt": result.get("receipt", {})})
+            return {"result": "protected", "position_id": pid, "plan": asdict(plan), "observed": observed}
+
+    async def _emergency_close(self, decision_id, pid):
+        try:
+            await self.broker.close(pid)
+            if await self.broker.confirm_closed(pid):
+                self.journal.transition(decision_id, "closed")
+        except BaseException:
+            pass
+        # Even confirmed emergency close never clears the persistent halt.
+
+    @staticmethod
+    def _plan(payload):
+        values = json.loads(payload)["plan"]
+        for key in ("entry", "stop", "take_profit", "size", "risk", "margin", "budget", "risk_fraction"):
+            if key in values:
+                values[key] = D(values[key])
+        return SimpleNamespace(**values)
+
+    async def _audit_protected(self):
+        rows = self.journal.db.execute(
+            "SELECT id,position_id,payload FROM intents WHERE state='protected'").fetchall()
+        for intent_id, pid, payload in rows:
+            try:
+                observed = await self.broker.position(pid)
+                if observed is None and await self.broker.confirm_closed(pid):
+                    self.journal.transition(intent_id, "closed")
+                    continue
+                await self.broker.verify(self._plan(payload), observed)
             except Exception:
-                self.journal.transition(decision_id, "unknown")
-                try:
-                    await self.broker.close(position_id)
-                    observed = await self.broker.position(position_id)
-                    if observed is None:
-                        self.journal.transition(decision_id, "closed")
-                except Exception:
-                    pass
-                raise ExecutionHalted("Protection or fill not verified; emergency close attempted, reconcile required") from None
-            self.journal.transition(decision_id, "protected")
-            self.journal.append("trades", {"intent_id": decision_id, "position_id": position_id,
-                                           "status": "protected", "plan": payload})
-            return {"result": "protected", "position_id": position_id, "plan": payload}
+                self.journal.transition(intent_id, "unknown")
+                self._halt("Previously protected position changed")
+                await self._emergency_close(intent_id, pid)
+                raise ExecutionHalted("Protected position unverified; emergency close attempted") from None
 
     async def reconcile(self):
+        """No unknown order is resubmitted. Known unresolved positions must be closed.
+
+        Missing submission IDs require manual broker-history investigation. Protected
+        position changes trigger a single emergency close and remain latched.
+        """
         async with self.lock:
-            for intent_id, state, position_id in self.journal.unsettled():
-                if state != "unknown": self.journal.transition(intent_id, "unknown")
-                if not position_id:
-                    raise ExecutionHalted("Unknown order without exchange ID requires broker-supported request lookup")
-                position = await self.broker.position(position_id)
-                if position is None:
-                    self.journal.transition(intent_id, "closed")
-                elif position.get("stop") and position.get("take_profit"):
-                    # Presence alone is insufficient: close/review rather than guessing sizing.
-                    raise ExecutionHalted("Open position found; validate fill and portfolio risk before resuming")
+            await self.broker.health()
+            for intent_id, state, pid in self.journal.unsettled():
+                if state != "unknown":
+                    self.journal.transition(intent_id, "unknown")
+                if not pid or not await self.broker.confirm_closed(pid):
+                    self._halt("Unsettled execution intent")
+                    raise ExecutionHalted("Broker history/manual investigation required")
+                self.journal.transition(intent_id, "closed")
+            await self._audit_protected()
+            self.journal.set_meta("execution_halt", "")
+            return {"result": "reconciled"}
 
-
-class PaperBroker:
-    kind = "paper"
-    def __init__(self, account):
-        self.snapshot = account
-        self.positions = {}
-
-    async def account(self):
-        from dataclasses import replace
-        from decimal import Decimal
-        import time
-        used = sum((v["margin"] for v in self.positions.values()), Decimal(0))
-        risk = sum((v["risk"] for v in self.positions.values()), Decimal(0))
-        return replace(self.snapshot, used_margin=used, open_risk=risk,
-                       available_margin=max(Decimal(0), self.snapshot.available_margin-used), timestamp=time.time())
-
-    async def open(self, plan):
-        from uuid import uuid4
-        pid = "paper-" + str(uuid4())
-        self.positions[pid] = {"size": plan.size, "entry": plan.entry, "stop": plan.stop,
-            "take_profit": plan.take_profit, "margin": plan.margin, "risk": plan.risk}
-        return {"positionId": pid}
-    async def set_protection(self, pid, stop, target):
-        self.positions[pid].update(stop=stop, take_profit=target)
-    async def position(self, pid): return self.positions.get(pid)
-    async def close(self, pid): self.positions.pop(pid, None)
+    def status(self, decision_id=None):
+        if decision_id:
+            row = self.journal.db.execute("SELECT state,position_id FROM intents WHERE id=?", (decision_id,)).fetchone()
+            return {"decision_id": decision_id, "state": row[0] if row else "not_seen",
+                    "position_id": row[1] if row else None}
+        return {"halted": bool(self.journal.meta("execution_halt")), "unsettled": len(self.journal.unsettled())}
