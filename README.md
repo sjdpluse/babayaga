@@ -31,12 +31,17 @@ flowchart TD
 - `execution/agent.py`: single-process Windows agent, authenticated bounded HTTP API,
   TLS required for non-loopback binding, persistent journal and five-second position checks.
 - `execution/remote.py`: Linux-safe client; no order retries after timeout or uncertain outcome.
+- `worker/`: closed-bar demo strategy, durable signal outbox, restart recovery, and Railway status server.
 
-`truetrade.main` remains the legacy research/collection worker. Merely starting it or
-setting MT5 credentials on Railway does **not** start the Windows agent or generate
-MT5 trading signals. The explicit signal integration boundary is
-`await SignalClient.from_env().submit(signal)`. The engine chooses the adapter's sizing
-model; strategy modules never import or call MetaTrader5.
+`truetrade.worker.mt5` is now the Railway start command. It reads closed candles through
+the Windows agent, runs the explicit `breakout_demo` baseline, durably records each
+bar/decision before POST, and verifies the agent journal afterwards. It accepts only
+paper/demo, never live. See [Railway operational setup](docs/RAILWAY_MT5.md).
+
+`truetrade.main` remains the legacy research/collection worker and can be run explicitly.
+The existing PPO code and training workflow are preserved; no trained CFD model is
+bundled or silently substituted. The demo baseline is a separate execution test strategy.
+Strategy modules never import or call MetaTrader5.
 
 Code classification and retained limitations: [migration review](docs/MT5_MIGRATION.md).
 The previous setup, training and The True Trade instructions are preserved in
@@ -215,10 +220,11 @@ using a consistent SQLite backup procedure; do not discard state to clear a halt
 
 The Windows journal uses the existing audit/outbox schema. The existing Supabase sink
 is preserved, but the new agent does not automatically flush its outbox to Supabase.
-Remote archival/monitoring integration is a remaining operational task. No existing
-Railway deployment, database, live account or production credentials are changed here.
+Remote archival/monitoring integration is a remaining operational task. Worker decisions
+and received candles persist separately in `STATE_DIR/mt5-worker.sqlite`; the authoritative
+execution journal stays on Windows. The worker does not require a separate SQL server.
 
-Authenticated API: GET `/health`, `/status`, `/decisions/{id}`; POST `/signals`, `/market`,
+Authenticated API: GET `/health`, `/status`, `/execution-state`, `/decisions/{id}`; POST `/signals`, `/market`,
 `/candles`, `/reconcile`. There is no API for changing credentials, enabling live mode,
 or resetting unknown orders. Generic strategies depend on the broker contracts and
 signal client, never on the terminal package.
@@ -255,8 +261,8 @@ signal client, never on the terminal package.
 - Historical PPO/feature code is preserved. MT5 candles distinguish tick volume from
   real volume and do not synthesize missing market data. Existing crypto simulator
   assumptions (funding, continuous sessions, linear margin) still need CFD-specific
-  calibration before model results can be trusted. No model is automatically promoted
-  into an autonomous MT5 trading loop by this migration.
+  calibration before model results can be trusted. No PPO model is automatically promoted. The separate `breakout_demo` worker
+  is operational for demo signal generation and is not a validated profitable strategy.
 
 Before live use: verify the installed MT5 package/terminal and exact broker account on
 Windows; validate both directions, fills, SL/TP, restart/outage recovery and account

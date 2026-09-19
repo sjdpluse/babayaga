@@ -6,7 +6,7 @@ from dataclasses import asdict
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError
-from truetrade.brokers.base import OrderUncertain, BrokerError
+from truetrade.brokers.base import OrderUncertain, OrderRejected, BrokerError
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -39,7 +39,9 @@ class SignalClient:
             with self.opener.open(request, timeout=25) as response:
                 return json.loads(response.read(2000000))
         except HTTPError as error:
-            if method == "POST" and path == "/signals" and error.code not in {400, 401, 404, 422}:
+            if method == "POST" and path == "/signals":
+                if error.code in {400, 401, 404, 422}:
+                    raise OrderRejected("Agent rejected signal before execution") from None
                 raise OrderUncertain("Agent execution unsettled; query original decision ID") from None
             raise BrokerError("Agent request rejected; inspect decision status") from None
         except Exception:
@@ -50,6 +52,9 @@ class SignalClient:
     async def submit(self, signal):
         signal.validate_time()
         return await asyncio.to_thread(self._request, "POST", "/signals", asdict(signal))
+
+    async def execution_state(self):
+        return await asyncio.to_thread(self._request, "GET", "/execution-state")
 
     async def decision(self, decision_id):
         import re

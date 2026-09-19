@@ -6,6 +6,7 @@ import os
 from dataclasses import asdict
 from pathlib import Path
 import ssl
+from uuid import uuid4
 from truetrade.brokers.base import Signal, BrokerError, OrderRejected
 from truetrade.brokers.mt5_config import MT5Settings
 from truetrade.config import RiskLimits
@@ -49,6 +50,8 @@ class Agent:
             raise ValueError("Agent symbol allowlist required")
         self.engine, self.token = engine, token
         self.allowed_symbols = set(allowed_symbols)
+        if not engine.journal.meta("agent_state_id"):
+            engine.journal.set_meta("agent_state_id", str(uuid4()))
 
     async def dispatch(self, method, path, headers, body):
         if not hmac.compare_digest(headers.get("authorization", "").encode(), ("Bearer "+self.token).encode()):
@@ -58,6 +61,13 @@ class Agent:
                 return 200, await self.engine.broker.health()
             if method == "GET" and path == "/status":
                 return 200, self.engine.status()
+            if method == "GET" and path == "/execution-state":
+                async with self.engine.lock:
+                    return 200, {"protocol": 1, "identity": self.engine.broker.identity,
+                                 "state_id": self.engine.journal.meta("agent_state_id"),
+                                 "health": await self.engine.broker.health(),
+                                 "execution": self.engine.status(),
+                                 "positions": await self.engine.broker.open_positions()}
             if method == "GET" and path.startswith("/decisions/"):
                 return 200, self.engine.status(path.removeprefix("/decisions/"))
             if method != "POST":

@@ -16,6 +16,7 @@ mt5 = ["MetaTrader5>=5.0,<6; sys_platform == 'win32'"]
 [project.scripts]
 truetrade = "truetrade.main:main"
 babayaga-mt5-agent = "truetrade.execution.agent:main"
+babayaga-mt5-worker = "truetrade.worker.mt5:main"
 
 [tool.setuptools.packages.find]
 include = ["truetrade*", "scripts*"]

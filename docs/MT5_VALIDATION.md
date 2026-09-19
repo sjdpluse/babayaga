@@ -7,8 +7,10 @@ by development tests. Linux Python execution does not load the Windows MT5 binar
 
 Local checks:
 
-- `python -m unittest discover -s tests -v`: **97 tests passed** (50 existing/regression + 47 MT5/config/API tests).
+- `python -m unittest discover -s tests -v`: **122 tests passed** (50 existing/regression + 47 MT5/config/API + 25 worker tests).
 - `python -m unittest discover -s tests -p test_mt5.py -v`: **47 tests passed**.
+- `python -m unittest discover -s tests -p test_mt5_worker.py -v`: **25 tests passed**.
+- `python -m truetrade.worker.mt5 --once`: starts safely with `missing_agent_url_or_token` when unconfigured.
 - `python -m truetrade.main --once`: existing research worker starts with trading blocked.
 - `python -m compileall -q truetrade scripts tests`: successful compilation.
 - `git diff --check`: no whitespace errors.
@@ -47,3 +49,12 @@ that Windows/terminal smoke testing has been performed.
 
 Before any live rollout, the operator must complete the real-terminal demo checks,
 CFD strategy/cost validation, secure deployment and recovery procedures in README.
+
+## Operational worker follow-up
+
+25 tests additionally cover actual feature calculation from closed bars through local
+authenticated HTTP to FakeMT5 and both journals, hold and SHORT signals, paper without
+terminal orders, duplicate/restart/concurrency, timeout after confirmed fill, lost
+terminal result, crash before POST, live/mode/account-journal switching, atomic flat
+account guard, stale/forming candles, missing configuration, secret redaction and
+required volume enforcement. These tests never log in to an actual MT5 terminal.
