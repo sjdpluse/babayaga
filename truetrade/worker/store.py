@@ -6,8 +6,11 @@ from truetrade.persistence.store import Journal
 
 class WorkerStore(Journal):
     def __init__(self, path):
+        self.path=path
         super().__init__(path)
         self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS worker_feedback (
+            id TEXT PRIMARY KEY, model_sha TEXT NOT NULL, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS worker_bars (
             stream TEXT NOT NULL, timestamp INTEGER NOT NULL, payload TEXT NOT NULL,
             PRIMARY KEY(stream,timestamp));
@@ -43,3 +46,19 @@ class WorkerStore(Journal):
     def last_decision(self):
         row = self.db.execute("SELECT id,state,bar_time FROM worker_decisions ORDER BY rowid DESC LIMIT 1").fetchone()
         return dict(zip(("id","state","bar_time"),row)) if row else None
+
+    def feedback_pending(self):
+        return self.db.execute("SELECT id,payload FROM worker_decisions WHERE state='closed' AND id NOT IN (SELECT id FROM worker_feedback)").fetchall()
+
+    def save_feedback(self,key,model_sha,payload):
+        encoded=json.dumps(payload,default=str,sort_keys=True,allow_nan=False)
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO worker_feedback VALUES (?,?,?)",(key,model_sha,encoded))
+
+    def bars(self,stream):
+        return [json.loads(r[0]) for r in self.db.execute("SELECT payload FROM worker_bars WHERE stream=? ORDER BY timestamp",(stream,))]
+
+    def feedback(self,model_sha=None):
+        rows=self.db.execute("SELECT payload FROM worker_feedback"+(" WHERE model_sha=?" if model_sha else ""),
+                             (model_sha,) if model_sha else ())
+        return [json.loads(r[0]) for r in rows]

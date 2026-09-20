@@ -32,8 +32,9 @@ class MT5Worker:
         self.lock = asyncio.Lock()
         self.last_cycle = None
         self.state = {"process": "running", "worker": "mt5", "ready": False,
-                      "trading": "blocked", "reason": "starting", "strategy": "breakout_demo"}
+                      "trading": "blocked", "reason": "starting", "strategy": "ppo_cfd"}
         self.previous_status = None
+        self.learning = None
 
     def status(self, ready, reason):
         self.state.update(ready=ready, trading="enabled" if ready else "blocked", reason=reason,
@@ -42,6 +43,8 @@ class MT5Worker:
     def configuration(self):
         if self.settings is None:
             self.settings = WorkerSettings.from_env()
+        self.state.update(mode=self.settings.mode, symbol=self.settings.symbol, timeframe=self.settings.timeframe,
+                          strategy=self.settings.strategy)
         if self.client is None:
             url = os.getenv("MT5_AGENT_URL", "")
             token = os.getenv("MT5_AGENT_TOKEN", "")
@@ -52,7 +55,8 @@ class MT5Worker:
                     urlsplit(url).hostname in {"localhost", "127.0.0.1", "::1"}):
                 raise ValueError("Railway requires a remote HTTPS agent")
             self.client = SignalClient(url, token)
-        self.state.update(mode=self.settings.mode, symbol=self.settings.symbol, timeframe=self.settings.timeframe)
+        self.state.update(mode=self.settings.mode, symbol=self.settings.symbol, timeframe=self.settings.timeframe,
+                          strategy=self.settings.strategy)
         return True
 
     async def recover(self):
@@ -78,7 +82,7 @@ class MT5Worker:
             if snapshot.get("protocol") != 1 or not isinstance(snapshot.get("positions"), list):
                 raise BrokerError("Agent upgrade required")
             health = snapshot["health"]
-            if health.get("mode") != self.settings.mode or health.get("mode") not in {"paper", "demo"}:
+            if health.get("mode") != self.settings.mode or health.get("mode") not in {"paper", "demo", "live"}:
                 self.status(False, "agent_mode_mismatch_or_live_blocked")
                 return
             if not health.get("connected") or not health.get("execution_allowed"):
@@ -107,6 +111,13 @@ class MT5Worker:
             candles = closed_candles(rows, cfg, now)
             stream = cfg.symbol+":"+cfg.timeframe
             self.store.capture(stream, rows)
+            model_ready=True
+            if cfg.strategy=='ppo_cfd':
+                from truetrade.cfd.learning import Learning
+                if self.learning is None:
+                    self.learning=Learning(self.store,cfg,Path(self.store.path).parent/'cfd')
+                model_ready=await self.learning.service(self.client,rows,TIMEFRAMES[cfg.timeframe])
+                self.state['learning']=self.learning.status
             bar = int(candles.timestamp[-1])
             self.state["last_closed_bar"] = bar
             if now - (bar+TIMEFRAMES[cfg.timeframe]) > cfg.max_bar_age:
@@ -120,6 +131,9 @@ class MT5Worker:
             if time.time() >= bar_deadline:
                 self.status(False, "stale_candles_or_market_closed")
                 return
+            if not model_ready:
+                self.status(False,"no_qualified_ppo_model")
+                return
             if self.store.seen(stream, bar):
                 self.status(True, "waiting_for_next_closed_bar")
                 return
@@ -128,13 +142,20 @@ class MT5Worker:
                 self.store.record(key, stream, bar, "skipped", detail="account_has_open_position")
                 self.status(True, "position_open_waiting_for_sl_tp")
                 return
-            side, atr = choose(candles)
+            model_sha=None
+            if cfg.strategy=='ppo_cfd':
+                side,atr,model_sha=self.learning.choose(rows)
+                from truetrade.risk.manager import decimal as D
+                atr=D(atr)
+                self.state['model_sha256']=model_sha
+            else:
+                side, atr = choose(candles)
             if side is None:
-                self.store.record(key, stream, bar, "hold", detail="no_breakout")
+                self.store.record(key, stream, bar, "hold", detail="policy_hold")
                 self.status(True, "no_signal")
                 return
             sig = make_signal(key, side, atr, market, cfg, time.time())
-            sig = replace(sig, expected_identity=identity, expected_state_id=epoch,
+            sig = replace(sig, expected_identity=identity, expected_state_id=epoch, model_sha256=model_sha,
                           expires_at=min(sig.expires_at, bar_deadline))
             # One atomic, fully-synced write BEFORE any network submission.
             # A crash from this point is uncertain, even if POST never left the host.
@@ -169,8 +190,10 @@ class MT5Worker:
         except Exception:
             if self.state.get("reason") != "uncertain_signal_manual_reconciliation_required":
                 self.status(False, "agent_unavailable_or_read_failed")
+        if self.learning:
+            self.state["learning"]=self.learning.status
         self.last_cycle = time.time()
-        summary = {k:self.state[k] for k in ("worker", "ready", "trading", "reason")}
+        summary = {k:self.state[k] for k in ("worker", "ready", "trading", "reason", "strategy", "learning") if k in self.state}
         if summary != self.previous_status:
             emit("mt5_worker_status", summary)
             self.previous_status = summary
@@ -238,6 +261,8 @@ async def serve(once=False):
             if server:
                 server.close()
                 await server.wait_closed()
+            if worker.learning:
+                await worker.learning.close()
             store.close()
 
 

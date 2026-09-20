@@ -31,16 +31,21 @@ flowchart TD
 - `execution/agent.py`: single-process Windows agent, authenticated bounded HTTP API,
   TLS required for non-loopback binding, persistent journal and five-second position checks.
 - `execution/remote.py`: Linux-safe client; no order retries after timeout or uncertain outcome.
-- `worker/`: closed-bar demo strategy, durable signal outbox, restart recovery, and Railway status server.
+- `worker/`: closed-bar policy inference, durable signal outbox, restart recovery, and Railway status server.
+- `cfd/`: gold CFD simulation, chronological PPO training, qualification registry and demo feedback.
 
 `truetrade.worker.mt5` is now the Railway start command. It reads closed candles through
-the Windows agent, runs the explicit `breakout_demo` baseline, durably records each
-bar/decision before POST, and verifies the agent journal afterwards. It accepts only
-paper/demo, never live. See [Railway operational setup](docs/RAILWAY_MT5.md).
+the Windows agent and defaults to `ppo_cfd`. It collects real gold history, trains and
+evaluates candidates, and only activates a qualified model for demo. It durably records
+bar/decision before POST and verifies the agent journal afterwards. Live additionally
+requires explicit flags and forward-demo evidence for the identical model weights.
+See [Railway setup](docs/RAILWAY_MT5.md) and [gold learning and promotion](docs/GOLD_PPO.md).
 
 `truetrade.main` remains the legacy research/collection worker and can be run explicitly.
 The existing PPO code and training workflow are preserved; no trained CFD model is
-bundled or silently substituted. The demo baseline is a separate execution test strategy.
+bundled or silently substituted. Without a qualified model the worker blocks orders;
+it never falls back to `breakout_demo`. That explicit demo-only rule remains available
+for execution testing. Initial learned-policy scope is XAUUSD on USD accounts.
 Strategy modules never import or call MetaTrader5.
 
 Code classification and retained limitations: [migration review](docs/MT5_MIGRATION.md).
@@ -117,6 +122,10 @@ $env:MT5_PASSWORD = $credential.GetNetworkCredential().Password
 $env:MT5_MODE = "demo"
 $env:ALLOW_LIVE_TRADING = "false"
 $env:MT5_COMMISSION_PER_LOT = Read-Host "Reviewed round-trip commission per lot in account currency (0 only if verified)"
+$env:MT5_RESEARCH_SWAP_LONG_PER_LOT_DAY = Read-Host "Reviewed conservative long rollover USD cost per lot per day"
+$env:MT5_RESEARCH_SWAP_SHORT_PER_LOT_DAY = Read-Host "Reviewed conservative short rollover USD cost per lot per day"
+$env:MT5_RESEARCH_ROLLOVER_UTC_HOUR = Read-Host "Reviewed UTC rollover hour (0-23)"
+$env:MT5_RESEARCH_TRIPLE_WEEKDAY = Read-Host "Reviewed triple-cost weekday (0=Monday to 4=Friday)"
 $env:MT5_MAX_SPREAD_POINTS = Read-Host "Maximum permitted spread in SYMBOL points"
 $env:MAX_TRADE_RISK = "0.005"
 $env:MT5_STATE_DIR = "$PWD\data\mt5-demo"
@@ -130,6 +139,13 @@ securely with the client process; do not paste it into GitHub, logs or chat.
 For a same-machine demo, another PowerShell session needs `MT5_AGENT_URL` and that same
 token. Alternatively, configure these session variables before starting the agent as
 a separate process so the child inherits them.
+
+For **automatic PPO demo operation**, use the Railway settings in
+[the worker runbook](docs/RAILWAY_MT5.md), or start `python -m truetrade.worker.mt5`
+in another configured client session with `MT5_MODE=demo`, `MT5_STRATEGY=ppo_cfd` and
+durable `STATE_DIR`. Give the terminal enough real XAUUSD M5 history. It waits for
+50,000 bars/180 days and successful model qualification before generating trades.
+The manual connectivity commands below are optional and do not train a model.
 
 7. In the client session, inspect connection and XAUUSD without placing an order:
 
@@ -188,11 +204,16 @@ signal before submitting, then query status after any transport uncertainty.
 | `MT5_SYMBOL_MAP` | Optional JSON mapping to exact terminal symbols |
 | `MT5_MAGIC` | Ownership marker, default `730021`; use a dedicated account and one agent |
 | `MT5_COMMISSION_PER_LOT` | **No default**; round-trip estimate in account currency per lot; required to size |
+| `MT5_RESEARCH_SWAP_LONG_PER_LOT_DAY`, `MT5_RESEARCH_SWAP_SHORT_PER_LOT_DAY` | Windows; reviewed nonnegative USD rollover costs per lot/day; mandatory for gold learning |
+| `MT5_RESEARCH_ROLLOVER_UTC_HOUR`, `MT5_RESEARCH_TRIPLE_WEEKDAY` | Windows; reviewed rollover calendar, no defaults; see gold runbook |
 | `MT5_MAX_SPREAD_POINTS` | Default 50 **points**, not pips or dollars; review for each symbol |
 | `MT5_DEVIATION_POINTS`, `MT5_EXIT_SLIPPAGE_POINTS` | Default 20 each; modeled allowances, not guaranteed fills |
 | `MAX_TRADE_RISK` | Existing maximum 5% ceiling; example setup lowers it to 0.5% |
 | `MAX_PORTFOLIO_RISK`, `MAX_MARGIN_UTILIZATION` | Existing aggregate risk and margin ceilings, defaults 10% / 50% |
 | `CIRCUIT_ENABLED`, `CIRCUIT_DRAWDOWN` | Existing drawdown circuit, defaults true / 15%; MT5 peak equity persisted |
+| `MT5_STRATEGY` | Worker default `ppo_cfd`; `breakout_demo` only by explicit demo selection |
+| `CFD_AUTO_TRAIN`, `CFD_TRAIN_EPISODES` | Worker: `true`, `2000`; automatic candidate training is demo-only |
+| `CFD_MODEL_REGISTRY` | Default `STATE_DIR/cfd/active.json`; live requires a separately approved release |
 
 MT5 volume is lots. Prices use tick size and digits; stops/freeze distances use points.
 The adapter evaluates loss and margin in the account currency using terminal calculators.
@@ -224,8 +245,9 @@ Remote archival/monitoring integration is a remaining operational task. Worker d
 and received candles persist separately in `STATE_DIR/mt5-worker.sqlite`; the authoritative
 execution journal stays on Windows. The worker does not require a separate SQL server.
 
-Authenticated API: GET `/health`, `/status`, `/execution-state`, `/decisions/{id}`; POST `/signals`, `/market`,
-`/candles`, `/reconcile`. There is no API for changing credentials, enabling live mode,
+Authenticated API: GET `/health`, `/status`, `/execution-state`, `/decisions/{id}`, `/outcome/{id}`;
+POST `/signals`, `/market`, `/candles`, `/history`, `/research-contract`, `/reconcile`.
+There is no API for changing credentials, enabling live mode,
 or resetting unknown orders. Generic strategies depend on the broker contracts and
 signal client, never on the terminal package.
 
@@ -258,11 +280,12 @@ signal client, never on the terminal package.
 - Fee, spread and slippage defaults are engineering limits, not JustMarkets guarantees.
   Commission/limits are currently global to an agent; separate instances/accounts or
   a reviewed per-symbol extension are needed for heterogeneous fee schedules.
-- Historical PPO/feature code is preserved. MT5 candles distinguish tick volume from
-  real volume and do not synthesize missing market data. Existing crypto simulator
-  assumptions (funding, continuous sessions, linear margin) still need CFD-specific
-  calibration before model results can be trusted. No PPO model is automatically promoted. The separate `breakout_demo` worker
-  is operational for demo signal generation and is not a validated profitable strategy.
+- Historical PPO/feature code is preserved. The gold workflow uses a separate CFD
+  simulator with real lot metadata, Bid/Ask, fees, gap losses and reviewed overnight
+  costs. It does not reuse the crypto environment. Only qualified demo candidates
+  are automatically activated; live promotion is explicit. No actual gold model or
+  performance result is bundled. Bar-level simulation and closed-trade forward
+  evidence have limitations documented in [GOLD_PPO.md](docs/GOLD_PPO.md).
 
 Before live use: verify the installed MT5 package/terminal and exact broker account on
 Windows; validate both directions, fills, SL/TP, restart/outage recovery and account

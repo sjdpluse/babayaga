@@ -39,7 +39,7 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         port = self.server.sockets[0].getsockname()[1]
         self.client = SignalClient(f'http://127.0.0.1:{port}', 't'*48)
         self.store = WorkerStore(self.path/'worker.sqlite')
-        self.cfg = WorkerSettings(mode='demo', timeframe='M1', bars=100)
+        self.cfg = WorkerSettings(mode='demo', strategy='breakout_demo', timeframe='M1', bars=100)
         self.worker = MT5Worker(self.store, self.cfg, self.client)
         boundary = int(time.time())//60*60
         self.rows = [dict(time=boundary-(100-i)*60, open=1995., high=1999., low=1990., close=1995.,
@@ -273,7 +273,7 @@ class WorkerConfigTests(unittest.TestCase):
         self.assertEqual(WorkerSettings().mode, 'paper')
         with self.assertRaises(ValueError): WorkerSettings(mode='live')
         with patch.dict(os.environ, {'MT5_MODE':'live', 'ALLOW_LIVE_TRADING':'true'}, clear=True):
-            with self.assertRaises(ValueError): WorkerSettings.from_env()
+            self.assertEqual(WorkerSettings.from_env().mode, 'live')
 
     def test_reject_random_model_mode_invalid_risk_or_window(self):
         for kw in [dict(strategy='ppo'), dict(risk=Decimal('NaN')), dict(risk=D('.01')), dict(bars=20), dict(timeframe='M2')]:

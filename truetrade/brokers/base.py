@@ -37,8 +37,11 @@ class Signal:
     expected_mode: str | None = None
     expected_identity: str | None = None
     expected_state_id: str | None = None
+    model_sha256: str | None = None
 
     def __post_init__(self):
+        if self.model_sha256 is not None and not re.fullmatch(r"[a-f0-9]{64}",self.model_sha256):
+            raise ValueError("Invalid model hash")
         if type(self.require_flat) is not bool or self.expected_mode not in {None, "paper", "demo", "live"}:
             raise ValueError("Invalid execution constraints")
         for value in (self.expected_identity, self.expected_state_id):
@@ -126,6 +129,7 @@ class CFDPlan:
     decision_id: str
     risk_fraction: Decimal
     expires_at: float
+    equity: Decimal = Decimal(0)
 
 
 @runtime_checkable

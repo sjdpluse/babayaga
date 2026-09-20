@@ -129,12 +129,14 @@ class MT5Broker:
         result.validate()
         return result
 
-    async def candles(self, name, timeframe="M1", count=200):
+    async def candles(self, name, timeframe="M1", count=200, start=1):
         name = await self.resolve_symbol(name)
         self._symbol(name)
         if timeframe not in {"M1", "M5", "M15", "M30", "H1", "H4", "D1"} or type(count) is not int or not 1 <= count <= 10000:
             raise OrderRejected("Invalid candle request")
-        bars = self.call("copy_rates_from_pos", name, getattr(self.api, "TIMEFRAME_"+timeframe), 1, count)
+        if type(start) is not int or not 1 <= start <= 2000000:
+            raise OrderRejected("Invalid history offset")
+        bars = self.call("copy_rates_from_pos", name, getattr(self.api, "TIMEFRAME_"+timeframe), start, count)
         if len(bars) != count:
             raise BrokerError("Insufficient closed-bar history")
         output = []
@@ -289,7 +291,8 @@ class MT5Broker:
         try:
             if not result.order or not result.deal:
                 raise ValueError()
-            deals = self.call("history_deals_get", ticket=int(result.deal))
+            deals = [d for d in self.call("history_deals_get", ticket=int(result.order))
+                     if d.ticket == result.deal]
             if len(deals) != 1:
                 raise ValueError()
             deal = deals[0]
@@ -413,3 +416,55 @@ class MT5Broker:
         outgoing = sum((D(d.volume) for d in deals if d.entry in
                         {self.api.DEAL_ENTRY_OUT, self.api.DEAL_ENTRY_OUT_BY}), D(0))
         return incoming > 0 and outgoing == incoming
+
+    async def research_contract(self, name):
+        """Read-only economics for USD gold research; require reviewed carry costs."""
+        import os
+        from dataclasses import asdict
+        from truetrade.cfd.contract import Contract
+        a=self._account_info()
+        info=await self.symbol_info(name)
+        raw=self._symbol(info.symbol)
+        if a.currency!='USD' or getattr(raw,'currency_profit',None)!='USD' or getattr(raw,'currency_base',None)!='XAU':
+            raise BrokerError('CFD learning currently requires USD gold contracts and a USD account')
+        q=await self.quote(info.symbol); volume=info.volume_min
+        values=[]; margins=[]
+        for side,entry in [('LONG',q.ask),('SHORT',q.bid)]:
+            sign=1 if side=='LONG' else -1
+            for distance in [D(1),D(10)]:
+                values.append(self.loss(side,info.symbol,volume,entry,entry-sign*distance)/(volume*distance))
+            margins.append(self.margin(side,info.symbol,volume,entry)/(volume*entry))
+        if min(values)<=0 or max(values)-min(values)>max(values)*D('.000001'):
+            raise BrokerError('Nonlinear gold PnL requires a different research model')
+        keys=('MT5_RESEARCH_SWAP_LONG_PER_LOT_DAY','MT5_RESEARCH_SWAP_SHORT_PER_LOT_DAY',
+              'MT5_RESEARCH_ROLLOVER_UTC_HOUR','MT5_RESEARCH_TRIPLE_WEEKDAY')
+        if self.settings.commission_per_lot is None or any(os.getenv(k) is None for k in keys):
+            raise BrokerError('Explicit reviewed commission and research swap/calendar values required')
+        contract=Contract(symbol={k:str(v) if isinstance(v,D(0).__class__) else v for k,v in asdict(info).items()},
+            currency=a.currency,value_per_price_lot=float(max(values)),margin_rate=float(max(margins)),
+            commission=float(self.settings.commission_per_lot),entry_slippage_points=self.settings.deviation_points,
+            exit_slippage_points=self.settings.exit_slippage_points,max_spread_points=float(self.settings.max_spread_points),
+            swap_long_cost=float(os.environ[keys[0]]),swap_short_cost=float(os.environ[keys[1]]),
+            rollover_utc_hour=int(os.environ[keys[2]]),triple_weekday=int(os.environ[keys[3]]),
+            source='mt5_demo' if a.trade_mode==self.api.ACCOUNT_TRADE_MODE_DEMO else 'mt5_live',observed_at=time.time())
+        return contract.json()
+
+    async def closed_outcome(self, pid):
+        if not await self.confirm_closed(pid):
+            raise BrokerError('Position outcome is not settled')
+        identifier=self.journal.meta('position_identifier:'+str(pid))
+        deals=self.call('history_deals_get',position=int(identifier))
+        if len({d.ticket for d in deals})!=len(deals):
+            raise BrokerError('Duplicate deal history')
+        entries=[d for d in deals if d.entry==self.api.DEAL_ENTRY_IN]
+        if not entries or any(d.magic!=self.settings.magic for d in entries):
+            raise BrokerError('Trade history ownership mismatch')
+        fields=('profit','commission','swap','fee')
+        # Missing monetary fields are unknown, never zero-filled rewards.
+        sums={key:sum((D(getattr(d,key)) for d in deals),D(0)) for key in fields}
+        return {'position_id':str(pid),'currency':self._account_info().currency,
+                'mode':self.settings.mode,'volume':sum((D(d.volume) for d in entries),D(0)),
+                'entry':sum((D(d.price)*D(d.volume) for d in entries),D(0))/sum((D(d.volume) for d in entries),D(0)),
+                'opened_at':min(d.time_msc for d in deals)/1000,'closed_at':max(d.time_msc for d in deals)/1000,
+                'net_pnl':sum(sums.values(),D(0)),**sums,'deal_ids':sorted(d.ticket for d in deals),
+                'cost_scope':'position_deals_excludes_unallocated_balance_adjustments'}

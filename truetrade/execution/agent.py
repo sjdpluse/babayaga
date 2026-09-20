@@ -68,6 +68,14 @@ class Agent:
                                  "health": await self.engine.broker.health(),
                                  "execution": self.engine.status(),
                                  "positions": await self.engine.broker.open_positions()}
+            if method == "GET" and path.startswith("/outcome/"):
+                key=path.removeprefix("/outcome/")
+                row=self.engine.journal.db.execute("SELECT state,position_id,payload FROM intents WHERE id=?",(key,)).fetchone()
+                if not row or row[0]!='closed':
+                    return 409, {"error":"outcome_not_closed"}
+                payload=json.loads(row[2]); outcome=await self.engine.broker.closed_outcome(row[1])
+                return 200, {"decision_id":key,"outcome":outcome,"plan":payload["plan"],
+                             "signal":json.loads(payload["request"])}
             if method == "GET" and path.startswith("/decisions/"):
                 return 200, self.engine.status(path.removeprefix("/decisions/"))
             if method != "POST":
@@ -88,6 +96,14 @@ class Agent:
                 info = await self.engine.broker.symbol_info(data["symbol"])
                 quote = await self.engine.broker.quote(info.symbol)
                 return 200, {"symbol": asdict(info), "quote": asdict(quote)}
+            if path == "/research-contract" and set(data)=={"symbol"}:
+                if data["symbol"] not in self.allowed_symbols:
+                    raise OrderRejected("Symbol outside agent allowlist")
+                return 200, await self.engine.broker.research_contract(data["symbol"])
+            if path == "/history" and set(data)=={"symbol","timeframe","count","start"}:
+                if data["symbol"] not in self.allowed_symbols:
+                    raise OrderRejected("Symbol outside agent allowlist")
+                return 200, {"candles":await self.engine.broker.candles(data["symbol"],data["timeframe"],data["count"],data["start"])}
             if path == "/candles" and set(data) == {"symbol", "timeframe", "count"}:
                 if data["symbol"] not in self.allowed_symbols:
                     raise OrderRejected("Symbol outside agent allowlist")

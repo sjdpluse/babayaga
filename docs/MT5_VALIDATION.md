@@ -7,9 +7,10 @@ by development tests. Linux Python execution does not load the Windows MT5 binar
 
 Local checks:
 
-- `python -m unittest discover -s tests -v`: **122 tests passed** (50 existing/regression + 47 MT5/config/API + 25 worker tests).
+- `python -m unittest discover -s tests -v`: **148 tests passed** (122 existing/regression + 26 gold CFD learning tests).
 - `python -m unittest discover -s tests -p test_mt5.py -v`: **47 tests passed**.
 - `python -m unittest discover -s tests -p test_mt5_worker.py -v`: **25 tests passed**.
+- `python -m unittest discover -s tests -p test_cfd_learning.py -v`: **26 tests passed**.
 - `python -m truetrade.worker.mt5 --once`: starts safely with `missing_agent_url_or_token` when unconfigured.
 - `python -m truetrade.main --once`: existing research worker starts with trading blocked.
 - `python -m compileall -q truetrade scripts tests`: successful compilation.
@@ -58,3 +59,28 @@ terminal orders, duplicate/restart/concurrency, timeout after confirmed fill, lo
 terminal result, crash before POST, live/mode/account-journal switching, atomic flat
 account guard, stale/forming candles, missing configuration, secret redaction and
 required volume enforcement. These tests never log in to an actual MT5 terminal.
+
+## Gold PPO follow-up
+
+26 additional tests cover shared causal observations, USD gold contract validation,
+actual PPO optimization on an explicitly synthetic test dataset, train-only
+normalization, chronological splits and refusal to reuse the reserved holdout. They
+cover Bid/Ask, lot risk, fees, swap/triple-day charges, session gaps, adverse gap stops,
+net-economic qualification and rejection of untrained/tampered/incompatible releases.
+
+The mocked end-to-end PPO path loads a **software-only fixture** checkpoint, selects
+LONG, computes valid lots, submits through authenticated HTTP, verifies actual fake
+position SL/TP and records both journals. Repeating the bar sends no duplicate.
+An uncertain fill latches a halt and is not retried. Identical qualified fixture
+weights produce identical demo/live predictions, while live without flags or forward
+evidence is blocked. These fixtures are not a claim of real model qualification.
+
+Agent feedback tests check deal-level profit, commission, swap and fee attribution,
+model linkage, deduplication and refusal to invent missing financial fields. The
+MT5 history mock and adapter now correctly interpret `history_deals_get(ticket=...)`
+as an **order** lookup; order/deal IDs are intentionally different in every fixture.
+Candidate recovery after restart and contract-change entry blocking are also covered.
+
+No real account data, qualified gold checkpoint or forward-demo performance is
+available from these tests. Windows connection, real history, reviewed costs,
+out-of-sample results and actual forward-demo trades are still required.

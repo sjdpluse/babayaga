@@ -93,4 +93,4 @@ def size_signal(signal, symbol, quote, account, limits, loss, margin,
         raise RiskRejected("Post-rounding risk limit")
     return CFDPlan(symbol.symbol, signal.side, entry, stop, target, size, risk,
                    required_margin, budget, time.time(), signal.decision_id,
-                   signal.risk_fraction, signal.expires_at)
+                   signal.risk_fraction, signal.expires_at, account.equity)

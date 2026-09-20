@@ -1,9 +1,11 @@
-# Operational MT5 demo worker
+# Operational MT5 gold learning worker
 
-This version runs automatically after the Windows agent is available and the worker
-variables are configured. It is a **demo baseline**, not a trained PPO deployment or
-an assertion of profitability. It never trades live, even when live flags are set.
-The actual terminal must still run on Windows. Railway does not host MT5.
+This version collects real gold data, trains/evaluates PPO candidates and operates
+automatically in demo after qualification. Setting connection variables starts that
+workflow; it does not supply a trained model or guarantee a trade. Default strategy is
+`ppo_cfd`, with no experimental-rule fallback. Live requires explicit authorization
+and forward evidence for the same frozen model. The terminal still runs on Windows.
+Read [GOLD_PPO.md](GOLD_PPO.md) for qualification, learning and remaining limitations.
 
 ## Automatic behavior
 
@@ -12,18 +14,21 @@ The actual terminal must still run on Windows. Railway does not host MT5.
 2. Query any previously sent decisions; never resend an uncertain POST.
 3. Read 256 closed candles by default; validate timestamps, OHLCV and freshness.
    Tick volume is preserved as tick volume, not labeled real traded volume.
-4. Run existing causal features. LONG: close breaks the previous 20 highs and EMA8 is
-   above EMA21. SHORT: close breaks the previous 20 lows and EMA8 is below EMA21.
-   Otherwise hold. The current candle is never used. This rule is named `breakout_demo`.
+4. Backfill real history and obtain reviewed USD gold economics. Train in a separate
+   process once 50,000 bars/180 days are available. A qualified PPO uses the existing
+   causal features plus session/spread context to select HOLD/LONG/SHORT. No qualified
+   model means no orders. The current candle is never used.
 5. Set a 2-ATR stop distance from current Bid/Ask and a 4-ATR take-profit distance.
-   Use at most 0.5% equity risk (configurable downwards); the agent calculates valid lots,
+   Use 0.5% equity risk matching the qualified model; the agent calculates valid lots,
    costs, margin and final normalized protection. No crypto lot/leverage assumptions.
 6. Persist the complete signal and stable per-bar decision ID before sending once.
    Include expected mode/account/journal and require the account to be flat. The agent
    rechecks these constraints within its execution lock, in addition to normal risk gates.
 7. Verify journal outcome; allow only one open position across the dedicated account.
-   Exit through broker SL/TP. No automatic reversal or trailing stop in this baseline.
-8. Repeat. No signal is a normal result, not a reason to force an order.
+   Exit through broker SL/TP. No automatic reversal or trailing stop.
+8. Record closed demo trade P&L and costs under the exact model identity. Calibrate
+   subsequent training costs and evaluate new candidates on newly reserved holdouts.
+   HOLD is a normal result, not a reason to force an order.
 
 **Uncertainty:** an HTTP timeout is followed by status queries only. If the agent
 journal confirms protected/closed/rejected, the worker records that outcome. `not_seen`
@@ -48,7 +53,9 @@ RAILWAY_RUN_UID=0
 MT5_REQUIRE_VOLUME=true
 MT5_MODE=demo
 ALLOW_LIVE_TRADING=false
-MT5_STRATEGY=breakout_demo
+MT5_STRATEGY=ppo_cfd
+CFD_AUTO_TRAIN=true
+CFD_TRAIN_EPISODES=2000
 MT5_SYMBOL=XAUUSD
 MT5_TIMEFRAME=M5
 MT5_HISTORY_BARS=256
@@ -64,9 +71,11 @@ Add these two values from your own Windows agent; do not use literal placeholder
 - `MT5_AGENT_TOKEN`: the same random secret of at least 32 characters as Windows.
 
 The worker starts even if those two values are absent and reports
-`missing_agent_url_or_token`. Add the values and redeploy. It then runs without
-manual signal commands when a fresh qualifying bar is available. There is no
-promise of an immediate trade; weekends, holds and risk rejection are expected.
+`missing_agent_url_or_token`. Add the values and redeploy. It then collects data and
+trains without manual signal commands, provided the Windows research settings and
+terminal history are available. Until qualification, `no_qualified_ppo_model` is an
+expected safe state. Weekends, holds, training failure and risk rejection can prevent
+orders. Tests and successful deployment alone prove no trading performance.
 
 `BOT_MODE`, `ENABLE_TRAINING`, `TRUETRADE_API_KEY` and `TRUETRADE_API_SECRET` are not
 used by this MT5 worker. `MT5_LOGIN/PASSWORD/SERVER/TERMINAL_PATH` belong on Windows,
@@ -77,9 +86,10 @@ login numbers are exposed by these public read-only endpoints.
 ## Windows agent setup
 
 Update the Windows checkout to the **same latest branch version** before connecting.
-The worker needs `/execution-state` protocol 1; an older agent will not work.
+The worker needs `/execution-state` protocol 1 and the `/history`, `/research-contract`
+and `/outcome/{id}` APIs; an older agent will not work.
 Follow README's exact installation, terminal login and permission steps first.
-Use one dedicated hedging DEMO account, one agent and one durable directory.
+Use one dedicated **USD hedging DEMO** account, one agent and one durable directory.
 
 Windows environment:
 
@@ -87,6 +97,9 @@ Windows environment:
 - `MT5_MODE=demo`, `ALLOW_LIVE_TRADING=false`.
 - `MT5_COMMISSION_PER_LOT`: reviewed round-trip commission in account currency/lot;
   explicit zero only if the account is confirmed commission-free.
+- Required reviewed research assumptions: `MT5_RESEARCH_SWAP_LONG_PER_LOT_DAY`,
+  `MT5_RESEARCH_SWAP_SHORT_PER_LOT_DAY`, `MT5_RESEARCH_ROLLOVER_UTC_HOUR`,
+  `MT5_RESEARCH_TRIPLE_WEEKDAY`. Units and conversion guidance are in GOLD_PPO.md.
 - `MT5_MAX_SPREAD_POINTS`: reviewed spread limit in symbol points.
 - `MAX_TRADE_RISK=0.005`; retain reviewed aggregate/margin/drawdown limits.
 - `MT5_ALLOWED_SYMBOLS=XAUUSD`; `MT5_SYMBOL_MAP` if suffix selection is ambiguous.
@@ -107,7 +120,11 @@ The MT5 terminal and agent must remain running; verify Windows restart/session b
 Railway automatically creates `/app/data/mt5-worker.sqlite`:
 - `worker_bars`: received candles, keyed by symbol/timeframe/open time.
 - `worker_decisions`: per-bar hold/skip/rejection and complete submitted signal/state.
+- `worker_feedback`: closed trade economics, original risk and exact model identity.
 - existing audit `events` and metadata tables.
+
+`/app/data/cfd` stores dataset snapshots, the research holdout ledger, immutable
+checkpoints, active/approved model manifests and training logs. Include it in backups.
 
 Windows retains `MT5_STATE_DIR/journal.sqlite` for authoritative execution intents,
 transitions, protection verification, account binding and halt state. Both use SQLite
@@ -137,5 +154,6 @@ mode changes and server-side flat-account checks. No real terminal is initialize
 
 Operational acceptance still requires your Windows agent URL, token and terminal.
 A successful Railway deployment alone proves neither broker connectivity nor strategy
-profitability. Live use requires a separately validated strategy and explicit design
-review; the automatic demo worker intentionally has no live override.
+profitability. Live needs the separate promotion procedure and evidence in GOLD_PPO.md,
+explicit mode/allow flags on both hosts, and reviewed operational readiness. Code
+defaults remain paper and `ALLOW_LIVE_TRADING=false`; no learning job changes these.

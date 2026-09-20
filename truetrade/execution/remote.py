@@ -68,3 +68,16 @@ class SignalClient:
     async def candles(self, symbol, timeframe="M1", count=200):
         return await asyncio.to_thread(self._request, "POST", "/candles",
                                       {"symbol": symbol, "timeframe": timeframe, "count": count})
+
+    async def research_contract(self, symbol):
+        return await asyncio.to_thread(self._request, "POST", "/research-contract", {"symbol":symbol})
+
+    async def history(self, symbol, timeframe, count, start):
+        return await asyncio.to_thread(self._request, "POST", "/history",
+                                      {"symbol":symbol,"timeframe":timeframe,"count":count,"start":start})
+
+    async def outcome(self, decision_id):
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}",decision_id):
+            raise ValueError("Invalid decision ID")
+        return await asyncio.to_thread(self._request,"GET","/outcome/"+decision_id)
