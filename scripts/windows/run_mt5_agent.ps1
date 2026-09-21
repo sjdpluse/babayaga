@@ -12,8 +12,13 @@ if (-not (Test-Path $tokenPath)) { throw "Missing encrypted agent token" }
 
 $config = Get-Content $configPath -Raw | ConvertFrom-Json
 
-$mt5Secure = Get-Content $passwordPath -Raw | ConvertTo-SecureString
-$tokenSecure = Get-Content $tokenPath -Raw | ConvertTo-SecureString
+$passwordCipher = (Get-Content $passwordPath -Raw).Trim()
+$tokenCipher = (Get-Content $tokenPath -Raw).Trim()
+if ([string]::IsNullOrWhiteSpace($passwordCipher)) { throw "Encrypted MT5 password is empty" }
+if ([string]::IsNullOrWhiteSpace($tokenCipher)) { throw "Encrypted agent token is empty" }
+
+$mt5Secure = ConvertTo-SecureString -String $passwordCipher
+$tokenSecure = ConvertTo-SecureString -String $tokenCipher
 $env:MT5_PASSWORD = [System.Net.NetworkCredential]::new("", $mt5Secure).Password
 $env:MT5_AGENT_TOKEN = [System.Net.NetworkCredential]::new("", $tokenSecure).Password
 
