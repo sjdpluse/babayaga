@@ -3,7 +3,7 @@ import asyncio
 import json
 from dataclasses import asdict
 from types import SimpleNamespace
-from truetrade.brokers.base import Broker, OrderRejected, OrderUncertain
+from truetrade.brokers.base import Broker, BrokerError, OrderRejected, OrderUncertain
 from truetrade.brokers.paper import PaperBroker  # Backwards-compatible import.
 from truetrade.risk.manager import decimal as D
 
@@ -22,6 +22,16 @@ class ExecutionEngine:
 
     def _halt(self, reason):
         self.journal.set_meta("execution_halt", reason)
+
+    @staticmethod
+    def _error_diagnostic(error, phase):
+        """Persist useful diagnostics without leaking arbitrary exception text."""
+        diagnostic = {"phase": phase, "error_type": type(error).__name__}
+        if isinstance(error, BrokerError):
+            diagnostic["error"] = str(error)
+        receipt = getattr(error, "receipt", None)
+        diagnostic["receipt"] = receipt if isinstance(receipt, dict) else {}
+        return diagnostic
 
     async def open(self, decision_id, market, side, entry, atr, confidence, tier=1., leverage=20):
         """Legacy paper/crypto entry point; preserve strategy and risk behavior."""
@@ -78,8 +88,9 @@ class ExecutionEngine:
                 pid = getattr(error, "position_id", None)
                 self.journal.transition(decision_id, "unknown", pid)
                 self._halt("Order outcome unknown")
-                self.journal.append("trades", {"intent_id": decision_id, "status": "unknown",
-                                               "receipt": getattr(error, "receipt", {})})
+                event = {"intent_id": decision_id, "status": "unknown",
+                         **self._error_diagnostic(error, "open")}
+                self.journal.append("trades", event)
                 if pid:
                     await self._emergency_close(decision_id, pid)
                 raise ExecutionHalted("Order outcome unknown; no automatic resubmission") from None
