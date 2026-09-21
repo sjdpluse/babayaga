@@ -6,7 +6,7 @@ from dataclasses import asdict
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import HTTPError
-from truetrade.brokers.base import OrderUncertain, BrokerError
+from truetrade.brokers.base import OrderUncertain, OrderRejected, BrokerError
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -39,7 +39,9 @@ class SignalClient:
             with self.opener.open(request, timeout=25) as response:
                 return json.loads(response.read(2000000))
         except HTTPError as error:
-            if method == "POST" and path == "/signals" and error.code not in {400, 401, 404, 422}:
+            if method == "POST" and path == "/signals":
+                if error.code in {400, 401, 404, 422}:
+                    raise OrderRejected("Agent rejected signal before execution") from None
                 raise OrderUncertain("Agent execution unsettled; query original decision ID") from None
             raise BrokerError("Agent request rejected; inspect decision status") from None
         except Exception:
@@ -50,6 +52,9 @@ class SignalClient:
     async def submit(self, signal):
         signal.validate_time()
         return await asyncio.to_thread(self._request, "POST", "/signals", asdict(signal))
+
+    async def execution_state(self):
+        return await asyncio.to_thread(self._request, "GET", "/execution-state")
 
     async def decision(self, decision_id):
         import re
@@ -63,3 +68,16 @@ class SignalClient:
     async def candles(self, symbol, timeframe="M1", count=200):
         return await asyncio.to_thread(self._request, "POST", "/candles",
                                       {"symbol": symbol, "timeframe": timeframe, "count": count})
+
+    async def research_contract(self, symbol):
+        return await asyncio.to_thread(self._request, "POST", "/research-contract", {"symbol":symbol})
+
+    async def history(self, symbol, timeframe, count, start):
+        return await asyncio.to_thread(self._request, "POST", "/history",
+                                      {"symbol":symbol,"timeframe":timeframe,"count":count,"start":start})
+
+    async def outcome(self, decision_id):
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}",decision_id):
+            raise ValueError("Invalid decision ID")
+        return await asyncio.to_thread(self._request,"GET","/outcome/"+decision_id)

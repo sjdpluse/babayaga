@@ -9,4 +9,4 @@ COPY scripts ./scripts
 COPY main.py ./
 RUN useradd --create-home --uid 10001 bot && mkdir -p /app/data && chown -R bot:bot /app
 USER bot
-CMD ["python", "-m", "truetrade.main"]
+CMD ["python", "-m", "truetrade.worker.mt5"]

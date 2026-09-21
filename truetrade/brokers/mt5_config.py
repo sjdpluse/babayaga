@@ -20,6 +20,7 @@ class MT5Settings:
     commission_per_lot: Decimal | None = None
     magic: int = 730021
     symbol_map: dict = field(default_factory=dict)
+    server_utc_offset_seconds: int = 0
 
     def __post_init__(self):
         if self.mode not in {"paper", "demo", "live"}:
@@ -28,6 +29,8 @@ class MT5Settings:
             raise ValueError("allow_live must be boolean")
         if self.login < 0 or not 1 <= self.magic <= 2147483647:
             raise ValueError("Invalid terminal identity")
+        if type(self.server_utc_offset_seconds) is not int or not -50400 <= self.server_utc_offset_seconds <= 50400:
+            raise ValueError("Invalid MT5 server UTC offset")
         object.__setattr__(self, "max_spread_points", D(self.max_spread_points))
         if self.commission_per_lot is not None:
             object.__setattr__(self, "commission_per_lot", D(self.commission_per_lot))
@@ -50,4 +53,5 @@ class MT5Settings:
                    exit_slippage_points=int(os.getenv("MT5_EXIT_SLIPPAGE_POINTS", "20")),
                    commission_per_lot=None if fee is None else D(fee),
                    magic=int(os.getenv("MT5_MAGIC", "730021")),
-                   symbol_map=json.loads(os.getenv("MT5_SYMBOL_MAP", "{}")))
+                   symbol_map=json.loads(os.getenv("MT5_SYMBOL_MAP", "{}")),
+                   server_utc_offset_seconds=int(os.getenv("MT5_SERVER_UTC_OFFSET_SECONDS", "0")))

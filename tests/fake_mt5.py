@@ -97,7 +97,7 @@ class FakeMT5:
                   deal=deal_id, order=order, volume=volume, price=price)
 
     def history_deals_get(self, ticket=None, position=None):
-        return tuple(d for d in self.deals.values() if (ticket is None or d.ticket == ticket)
+        return tuple(d for d in self.deals.values() if (ticket is None or d.order == ticket)
                      and (position is None or d.position_id == position))
 
     def copy_rates_from_pos(self, symbol, timeframe, start, count):

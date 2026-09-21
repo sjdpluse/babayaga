@@ -35,6 +35,16 @@ class ExecutionEngine:
     async def submit(self, signal):
         async def prepare():
             signal.validate_time()
+            if signal.expected_identity is not None and signal.expected_identity != self.broker.identity:
+                raise OrderRejected("Signal broker identity differs")
+            if signal.expected_state_id is not None and signal.expected_state_id != self.journal.meta("agent_state_id"):
+                raise OrderRejected("Signal agent journal differs")
+            if signal.expected_mode is not None:
+                health = await self.broker.health()
+                if health.get("mode") != signal.expected_mode:
+                    raise OrderRejected("Signal mode differs from execution account mode")
+            if signal.require_flat and await self.broker.open_positions():
+                raise OrderRejected("Signal requires an account with no open positions")
             return await self.broker.prepare(signal, self.risk.limits)
         return await self._execute(signal.decision_id, asdict(signal), prepare)
 

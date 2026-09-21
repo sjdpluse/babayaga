@@ -31,8 +31,11 @@ class MT5PaperBroker(PaperBroker):
     async def quote(self, name):
         return await self.market_data.quote(name)
 
-    async def candles(self, name, timeframe="M1", count=200):
-        return await self.market_data.candles(name, timeframe, count)
+    async def candles(self, name, timeframe="M1", count=200, start=1):
+        return await self.market_data.candles(name, timeframe, count, start)
 
     async def open_positions(self):
         return list(self.positions.values())
+
+    async def research_contract(self, name):
+        return await self.market_data.research_contract(name)
