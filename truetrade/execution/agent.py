@@ -144,7 +144,6 @@ class Agent:
                 if not 0 <= size <= 16384:
                     raise ValueError()
                 body = await reader.readexactly(size)
-            # A client timeout/disconnect must not cancel an in-flight trade.
             code, result = await self.dispatch(method, path, headers, body)
         except (ValueError, UnicodeError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
             pass
@@ -191,7 +190,7 @@ def tls_context(host):
 
 
 async def serve():
-    from truetrade.brokers.mt5 import MT5Broker
+    from truetrade.brokers.mt5_server_time import ServerTimeNormalizedMT5Broker
     from truetrade.brokers.mt5_paper import MT5PaperBroker
     settings = MT5Settings.from_env()
     state = Path(os.getenv("MT5_STATE_DIR", "data/mt5-"+settings.mode))
@@ -204,7 +203,7 @@ async def serve():
     context = tls_context(host)
     with ProcessLease(state/"agent.lock"):
         journal = Journal(state/"journal.sqlite")
-        source = MT5Broker(settings, journal)
+        source = ServerTimeNormalizedMT5Broker(settings, journal)
         watchdog = None
         try:
             await source.connect()
