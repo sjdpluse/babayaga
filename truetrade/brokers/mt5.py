@@ -5,8 +5,9 @@ explicit netting/ownership policy exists. Order tickets are not position IDs.
 """
 import hashlib
 import math
+import re
 import time
-from truetrade.brokers.base import BrokerError, OrderRejected, OrderUncertain, Symbol, Quote
+from truetrade.brokers.base import BrokerError, OrderRejected, OrderNotSubmitted, OrderUncertain, Symbol, Quote
 from truetrade.config import RiskLimits
 from truetrade.risk.manager import Account, decimal as D
 from truetrade.risk.cfd import size_signal, protection, validate_volume, validate_account
@@ -15,6 +16,21 @@ from truetrade.risk.cfd import size_signal, protection, validate_volume, validat
 # Documented SYMBOL_FILLING_MODE bits (not exported by the Python package).
 SYMBOL_FILLING_FOK = 1
 SYMBOL_FILLING_IOC = 2
+
+# Conservative allowlist from MetaQuotes' trade-server return codes. Timeout,
+# connection, processing errors, placed/partial/unknown responses stay uncertain.
+DEFINITE_REJECTIONS = frozenset({10004, 10006, 10013, 10014, 10015, 10016,
+    10017, 10018, 10019, 10020, 10021, 10022, 10024, 10026, 10027, 10030,
+    10032, 10033, 10034, 10035, 10040, 10042, 10043, 10044, 10045, 10046})
+
+# Canonical messages avoid logging arbitrary vendor strings (which can contain
+# credentials, paths or request contents). Preserve recognized argument names.
+LAST_ERROR_MESSAGES = {1: "success", -1: "generic failure", -2: "invalid arguments/parameters",
+    -3: "out of memory", -4: "history not found", -5: "invalid version",
+    -6: "authorization failed", -7: "unsupported method", -8: "auto-trading disabled",
+    -10000: "internal IPC error", -10001: "internal IPC send failed",
+    -10002: "internal IPC receive failed", -10003: "internal IPC initialization/connection failed",
+    -10005: "internal IPC timeout"}
 
 
 class MT5Broker:
@@ -31,13 +47,32 @@ class MT5Broker:
         self.identity = "mt5:" + hashlib.sha256(key.encode()).hexdigest()
         self.connected = False
 
+    def _last_error(self):
+        """Read immediately after failure, before another terminal call overwrites it."""
+        try:
+            code, message = self.api.last_error()
+            if type(code) is not int:
+                raise ValueError()
+            safe = LAST_ERROR_MESSAGES.get(code, "unrecognized error; vendor message redacted")
+            if code == -2 and isinstance(message, str):
+                field = re.fullmatch(r'Invalid [\"\'](action|symbol|volume|type|price|sl|tp|deviation|magic|comment|type_time|type_filling|position|expiration)[\"\'] argument', message)
+                if field:
+                    safe += ": " + field.group(1)
+            return {"code": code, "message": safe}
+        except BaseException:
+            return {"code": None, "message": "last_error unavailable"}
+
+    def _call_failure(self, method, outcome):
+        return BrokerError("MT5 " + method + " " + outcome,
+                           diagnostic={"method": method, "last_error": self._last_error()})
+
     def call(self, method, *args, **kwargs):
         try:
             value = getattr(self.api, method)(*args, **kwargs)
         except Exception:
-            raise BrokerError("MT5 " + method + " failed") from None
+            raise self._call_failure(method, "failed") from None
         if value is None:
-            raise BrokerError("MT5 " + method + " returned no result")
+            raise self._call_failure(method, "returned no result")
         return value
 
     async def connect(self):
@@ -234,22 +269,69 @@ class MT5Broker:
         return req
 
     def _send(self, request, deadline=None):
-        self._account_info(trading=True)
-        check = self.call("order_check", request)
-        if check.retcode != 0:
-            raise OrderRejected("MT5 order_check rejected request")
-        self._account_info(trading=True)
-        if deadline is not None and time.time() >= deadline:
-            raise OrderRejected("Signal or quote expired during order check")
+        # This block cannot submit an order. Its failures must never be confused
+        # with exceptions from the write or its subsequent fill verification.
+        method = "account_info"
+        try:
+            self._account_info(trading=True)
+            method = "order_check"
+            check = self.call("order_check", request)
+            if type(check.retcode) is not int:
+                raise BrokerError("MT5 order_check returned malformed result")
+            if check.retcode != 0:
+                raise OrderRejected("MT5 order_check rejected request", diagnostic={
+                    "method": method, "retcode": check.retcode, "last_error": self._last_error()})
+            method = "account_info"
+            self._account_info(trading=True)
+            if deadline is not None and time.time() >= deadline:
+                raise OrderRejected("Signal or quote expired during order check")
+        except BaseException as error:
+            diagnostic = dict(error.diagnostic) if isinstance(error, BrokerError) else {
+                "method": method, "last_error": self._last_error()}
+            diagnostic.update(stage="pre_submit", send_attempted=False)
+            message = str(error) if isinstance(error, BrokerError) else "MT5 pre-submit check failed"
+            raise OrderNotSubmitted(message, diagnostic=diagnostic) from None
+        # Exactly one write attempt. Even an exception reporting invalid arguments
+        # cannot prove that the write did not reach the terminal.
         try:
             result = self.api.order_send(request)
         except BaseException:
-            raise OrderUncertain("MT5 send interrupted; do not retry") from None
+            raise OrderUncertain("MT5 send interrupted; do not retry", diagnostic={
+                "method": "order_send", "stage": "send", "send_attempted": True,
+                "last_error": self._last_error()}) from None
         if result is None:
-            raise OrderUncertain("MT5 send returned no result; do not retry")
+            raise OrderUncertain("MT5 send returned no result; do not retry", diagnostic={
+                "method": "order_send", "stage": "send", "send_attempted": True,
+                "last_error": self._last_error()})
+        try:
+            receipt = self._receipt(result)
+        except BaseException:
+            raise OrderUncertain("MT5 send returned malformed result; do not retry", diagnostic={
+                "method": "order_send", "stage": "send", "send_attempted": True,
+                "last_error": self._last_error()}) from None
+        diagnostic = {"method": "order_send", "stage": "send", "send_attempted": True,
+                      "retcode": receipt.get("retcode")}
+        if receipt.get("retcode") != self.api.TRADE_RETCODE_DONE:
+            diagnostic["last_error"] = self._last_error()
+        if (all(type(receipt.get(key)) is int for key in ("retcode", "order", "deal")) and
+                receipt.get("retcode") in DEFINITE_REJECTIONS and
+                all(receipt.get(key) == 0 for key in ("order", "deal", "volume"))):
+            error = OrderRejected("MT5 order_send rejected request", diagnostic=diagnostic)
+            error.receipt = receipt
+            raise error
+        if receipt.get("retcode") not in {self.api.TRADE_RETCODE_DONE, self.api.TRADE_RETCODE_DONE_PARTIAL}:
+            raise OrderUncertain("MT5 send result uncertain; do not retry", receipt=receipt,
+                                 diagnostic=diagnostic)
         return result
 
-    async def open(self, plan):
+    @staticmethod
+    def _receipt(result):
+        # Never persist the raw request, comment, or arbitrary response fields.
+        return {key: value for key in ("retcode", "order", "deal", "volume", "price")
+                if type(value := getattr(result, key, None)) in {int, float} and math.isfinite(value)}
+
+    async def _prepare_open(self, plan):
+        """Read-only preflight; keep every send outside this method."""
         await self.assert_execution_allowed()
         if time.time()-plan.timestamp > 5 or plan.expires_at <= time.time():
             raise OrderRejected("Stale order plan")
@@ -283,10 +365,20 @@ class MT5Broker:
             raise OrderRejected("Insufficient margin")
         before = {p.identifier for p in self._positions()}
         comment = "by:" + hashlib.sha256(plan.decision_id.encode()).hexdigest()[:24]
-        result = self._send(self._request(raw, plan.side, plan.size, price, stop=plan.stop,
-                                         target=plan.take_profit, comment=comment),
-                            deadline=min(plan.expires_at, plan.timestamp+5))
-        receipt = {key: getattr(result, key, None) for key in ("retcode", "order", "deal", "volume", "price")}
+        request = self._request(raw, plan.side, plan.size, price, stop=plan.stop,
+                                target=plan.take_profit, comment=comment)
+        return info, before, request
+
+    async def open(self, plan):
+        try:
+            info, before, request = await self._prepare_open(plan)
+        except BaseException as error:
+            diagnostic = dict(error.diagnostic) if isinstance(error, BrokerError) else {}
+            diagnostic.update(stage="pre_submit", send_attempted=False)
+            message = str(error) if isinstance(error, BrokerError) else "MT5 pre-submit validation failed"
+            raise OrderNotSubmitted(message, diagnostic=diagnostic) from None
+        result = self._send(request, deadline=min(plan.expires_at, plan.timestamp+5))
+        receipt = self._receipt(result)
         pid = None
         try:
             if not result.order or not result.deal:
@@ -310,8 +402,11 @@ class MT5Broker:
                     D(deal.volume) != plan.size or abs(D(result.price)-D(deal.price)) > info.trade_tick_size/2 or
                     abs(D(matches[0].price_open)-D(deal.price)) > info.trade_tick_size/2):
                 raise ValueError()
-        except Exception:
-            raise OrderUncertain("MT5 receipt/fill not fully verified", pid, receipt) from None
+        except BaseException as error:
+            diagnostic = dict(error.diagnostic) if isinstance(error, BrokerError) else {}
+            diagnostic.update(stage="fill_verification", send_attempted=True)
+            raise OrderUncertain("MT5 receipt/fill not fully verified", pid, receipt,
+                                 diagnostic=diagnostic) from None
         return {"positionId": pid, "receipt": receipt}
 
     def _position_dict(self, p):

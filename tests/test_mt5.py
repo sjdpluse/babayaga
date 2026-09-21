@@ -9,7 +9,7 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
 from fake_mt5 import FakeMT5
-from truetrade.brokers.base import Signal, Broker, MarketBroker, BrokerError, OrderRejected, OrderUncertain
+from truetrade.brokers.base import Signal, Broker, MarketBroker, BrokerError, OrderRejected, OrderNotSubmitted, OrderUncertain
 from truetrade.brokers.mt5 import MT5Broker
 from truetrade.brokers.mt5_config import MT5Settings
 from truetrade.brokers.mt5_paper import MT5PaperBroker
@@ -154,6 +154,169 @@ class MT5Tests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.engine.status()["halted"])
         self.assertEqual(self.api.requests, [])
         self.assertEqual((await self.engine.submit(sig))["result"], "duplicate_suppressed")
+
+    def last_trade_event(self):
+        return json.loads(self.journal.db.execute(
+            "SELECT payload FROM events WHERE table_name='trades' ORDER BY rowid DESC LIMIT 1").fetchone()[0])
+
+    async def test_check_none_is_unsent_and_new_decision_can_succeed(self):
+        self.api.check_none = True
+        self.api.last_error_value = (-10005, "IPC timeout fixture-secret")
+        sig = signal()
+        with self.assertRaises(OrderNotSubmitted): await self.engine.submit(sig)
+        self.assertEqual(self.engine.status(sig.decision_id)["state"], "rejected")
+        self.assertFalse(self.engine.status()["halted"])
+        self.assertEqual(self.api.requests, [])
+        self.assertEqual(len(self.api.checks), 1)
+        diagnostic = self.last_trade_event()["broker_diagnostic"]
+        self.assertEqual(diagnostic["last_error"], {"code": -10005, "message": "internal IPC timeout"})
+        self.assertEqual(diagnostic["method"], "order_check")
+        self.assertFalse(diagnostic["send_attempted"])
+        self.assertNotIn("fixture-secret", json.dumps(self.last_trade_event()))
+        self.journal.close()
+        self.journal = Journal(self.path)
+        self.broker.journal = self.journal
+        self.engine = ExecutionEngine(self.broker, RiskManager(), self.journal)
+        self.api.check_none = False
+        self.assertEqual((await self.engine.submit(sig))["result"], "duplicate_suppressed")
+        self.assertEqual((await self.engine.submit(signal("new")))["result"], "protected")
+        self.assertEqual(len(self.api.requests), 1)
+
+    async def test_check_throws_or_is_interrupted_before_send(self):
+        for index, error in enumerate((RuntimeError("fixture-secret"), TimeoutError(), asyncio.CancelledError())):
+            with self.subTest(error=type(error).__name__):
+                self.api.check_error = error
+                self.api.last_error_value = (-2, 'Invalid "comment" argument')
+                sig = signal("check"+str(index))
+                with self.assertRaises(OrderNotSubmitted): await self.engine.submit(sig)
+                self.assertEqual(self.engine.status(sig.decision_id)["state"], "rejected")
+                self.assertFalse(self.engine.status()["halted"])
+                self.assertEqual(self.last_trade_event()["broker_diagnostic"]["last_error"]["message"],
+                                 "invalid arguments/parameters: comment")
+                self.assertNotIn("fixture-secret", json.dumps(self.last_trade_event()))
+        self.assertEqual(self.api.requests, [])
+        self.assertEqual(len(self.api.checks), 3)
+
+    async def test_read_failure_after_intent_before_send_is_rejected(self):
+        original = self.broker._prepare_open
+        async def fail_after_prepare(plan):
+            self.api.fail_positions = True
+            return await original(plan)
+        with patch.object(self.broker, "_prepare_open", side_effect=fail_after_prepare):
+            with self.assertRaises(OrderNotSubmitted): await self.engine.submit(signal())
+        self.assertEqual(self.engine.status("signal1")["state"], "rejected")
+        self.assertFalse(self.engine.status()["halted"])
+        self.assertEqual(self.api.requests, [])
+
+    async def test_account_read_failure_after_check_is_unsent(self):
+        original = self.api.order_check
+        def disconnect(req):
+            result = original(req)
+            self.api.terminal_value.connected = False
+            return result
+        with patch.object(self.api, "order_check", side_effect=disconnect):
+            with self.assertRaises(OrderNotSubmitted): await self.engine.submit(signal())
+        self.assertEqual(self.engine.status("signal1")["state"], "rejected")
+        self.assertFalse(self.engine.status()["halted"])
+        self.assertEqual(self.api.requests, [])
+
+    async def test_definite_send_rejections_are_durable_without_halt(self):
+        for code in (10006, 10014, 10019, 10030):
+            self.api.send_code = code
+            sig = signal("rejected"+str(code))
+            with self.assertRaises(OrderRejected): await self.engine.submit(sig)
+            self.assertEqual(self.engine.status(sig.decision_id)["state"], "rejected")
+            self.assertFalse(self.engine.status()["halted"])
+            self.assertEqual(self.last_trade_event()["receipt"]["retcode"], code)
+            self.assertTrue(self.last_trade_event()["broker_diagnostic"]["send_attempted"])
+            self.assertEqual((await self.engine.submit(sig))["result"], "duplicate_suppressed")
+        self.assertEqual(len(self.api.requests), 4)
+        self.assertEqual(self.api.positions, {})
+
+    async def test_ambiguous_send_codes_never_classified_as_rejected(self):
+        for code in (10008, 10011, 10012, 10023, 10028, 10031, 99999):
+            with self.subTest(code=code):
+                self.api.send_code = code
+                with self.assertRaises(OrderUncertain) as caught:
+                    self.broker._send({"action": 1})
+                self.assertTrue(caught.exception.diagnostic["send_attempted"])
+        self.assertEqual(len(self.api.requests), 7)
+
+    async def test_rejection_with_execution_evidence_or_missing_fields_is_uncertain(self):
+        for result in (NS(retcode=10014, order=123, deal=0, volume=0.),
+                       NS(retcode=10014, order=0, deal=0, volume=.01), NS(retcode=10014),
+                       NS(retcode=10014., order=0., deal=0., volume=0.)):
+            with patch.object(self.api, "order_send", return_value=result) as send:
+                with self.assertRaises(OrderUncertain): self.broker._send({"action": 1})
+                self.assertEqual(send.call_count, 1)
+
+    async def test_fill_history_failure_stays_unknown_even_when_check_succeeded(self):
+        with patch.object(self.api, "history_deals_get", return_value=None):
+            self.api.last_error_value = (-10002, "receive failed")
+            with self.assertRaises(ExecutionHalted): await self.engine.submit(signal())
+        self.assertEqual(self.engine.status("signal1")["state"], "unknown")
+        self.assertTrue(self.engine.status()["halted"])
+        self.assertEqual(len(self.api.requests), 1)
+        diagnostic = self.last_trade_event()["broker_diagnostic"]
+        self.assertEqual(diagnostic["stage"], "fill_verification")
+        self.assertEqual(diagnostic["method"], "history_deals_get")
+        self.assertEqual(diagnostic["last_error"]["code"], -10002)
+        with self.assertRaises(ExecutionHalted): await self.engine.submit(signal("next"))
+        self.assertEqual(len(self.api.requests), 1)
+
+    async def test_last_error_unavailable_cannot_change_submission_certainty(self):
+        self.api.check_none = True
+        with patch.object(self.api, "last_error", side_effect=RuntimeError("fixture-secret")):
+            with self.assertRaises(OrderNotSubmitted): await self.engine.submit(signal())
+        self.assertEqual(self.last_trade_event()["broker_diagnostic"]["last_error"]["code"], None)
+        self.api.check_none = False
+        self.api.lose_response = True
+        with patch.object(self.api, "last_error", side_effect=RuntimeError("fixture-secret")):
+            with self.assertRaises(ExecutionHalted): await self.engine.submit(signal("lost"))
+        self.assertTrue(self.engine.status()["halted"])
+        self.assertEqual(len(self.api.requests), 1)
+        self.assertNotIn("fixture-secret", json.dumps(self.last_trade_event()))
+
+    async def test_send_exception_types_all_remain_unknown_and_single_attempt(self):
+        for error in (RuntimeError("fixture-secret"), TimeoutError(), asyncio.CancelledError()):
+            with patch.object(self.api, "order_send", side_effect=error) as send:
+                with self.assertRaises(OrderUncertain) as caught: self.broker._send({"action": 1})
+                self.assertEqual(send.call_count, 1)
+                self.assertTrue(caught.exception.diagnostic["send_attempted"])
+                self.assertNotIn("fixture-secret", str(caught.exception))
+
+    async def test_unclassified_broker_error_is_still_unknown(self):
+        # The engine cannot assume every BrokerError means the adapter never sent.
+        with patch.object(self.broker, "open", side_effect=BrokerError("Unclassified failure")):
+            with self.assertRaises(ExecutionHalted): await self.engine.submit(signal())
+        self.assertEqual(self.engine.status("signal1")["state"], "unknown")
+        self.assertTrue(self.engine.status()["halted"])
+
+    async def test_send_timeout_response_halts_without_retry(self):
+        self.api.send_code = 10012
+        sig = signal()
+        with self.assertRaises(ExecutionHalted): await self.engine.submit(sig)
+        self.assertEqual(self.engine.status(sig.decision_id)["state"], "unknown")
+        for item in (sig, signal("next")):
+            with self.assertRaises(ExecutionHalted): await self.engine.submit(item)
+        self.assertEqual(len(self.api.requests), 1)
+
+    async def test_malformed_check_is_unsent(self):
+        for index, result in enumerate((NS(), NS(retcode="0"), NS(retcode=False))):
+            with patch.object(self.api, "order_check", return_value=result):
+                with self.assertRaises(OrderNotSubmitted): await self.engine.submit(signal("bad"+str(index)))
+            self.assertFalse(self.engine.status()["halted"])
+        self.assertEqual(self.api.requests, [])
+
+    async def test_unknown_last_error_text_and_receipt_strings_are_redacted(self):
+        self.api.last_error_value = (-98765, "password=fixture-secret Bearer token /private/path")
+        self.api.check_none = True
+        with self.assertRaises(OrderNotSubmitted): await self.engine.submit(signal())
+        self.assertEqual(self.last_trade_event()["broker_diagnostic"]["last_error"]["code"], -98765)
+        self.assertNotIn("fixture-secret", json.dumps(self.last_trade_event()))
+        receipt = self.broker._receipt(NS(retcode=10014, order="fixture-secret", deal=0,
+                                          volume=float("nan"), price=float("inf")))
+        self.assertEqual(receipt, {"retcode": 10014, "deal": 0})
 
     async def test_unknown_send_blocks_restart_no_retry(self):
         self.api.lose_response = True

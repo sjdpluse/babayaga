@@ -31,6 +31,8 @@ class ExecutionEngine:
             diagnostic["error"] = str(error)
         receipt = getattr(error, "receipt", None)
         diagnostic["receipt"] = receipt if isinstance(receipt, dict) else {}
+        if isinstance(error, BrokerError) and error.diagnostic:
+            diagnostic["broker_diagnostic"] = error.diagnostic
         return diagnostic
 
     async def open(self, decision_id, market, side, entry, atr, confidence, tier=1., leverage=20):
@@ -81,8 +83,10 @@ class ExecutionEngine:
                 pid = result["positionId"]
                 if not isinstance(pid, str) or not pid:
                     raise OrderUncertain("Missing position identity")
-            except OrderRejected:
+            except OrderRejected as error:
                 self.journal.transition(decision_id, "rejected")
+                self.journal.append("trades", {"intent_id": decision_id, "status": "rejected",
+                                               **self._error_diagnostic(error, "open")})
                 raise
             except BaseException as error:
                 pid = getattr(error, "position_id", None)
@@ -99,9 +103,11 @@ class ExecutionEngine:
                 await self.broker.set_protection(pid, plan.stop, plan.take_profit)
                 observed = await self.broker.position(pid)
                 await self.broker.verify(plan, observed)
-            except BaseException:
+            except BaseException as error:
                 self.journal.transition(decision_id, "unknown", pid)
                 self._halt("Protection or fill not verified")
+                self.journal.append("trades", {"intent_id": decision_id, "status": "unknown",
+                                               **self._error_diagnostic(error, "verify")})
                 await self._emergency_close(decision_id, pid)
                 raise ExecutionHalted("Protection/fill unverified; emergency close attempted; reconcile required") from None
             self.journal.transition(decision_id, "protected", pid)

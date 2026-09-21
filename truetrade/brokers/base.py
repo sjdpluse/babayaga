@@ -11,14 +11,22 @@ from truetrade.risk.manager import decimal as D, RiskRejected
 class BrokerError(RuntimeError):
     """Sanitized failure; never include secrets or raw vendor responses."""
 
+    def __init__(self, message, *, diagnostic=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic or {}
+
 
 class OrderRejected(BrokerError):
-    """Known rejection before submission."""
+    """Known unsent request or definite broker rejection without execution."""
+
+
+class OrderNotSubmitted(OrderRejected):
+    """The adapter proves order_send was never attempted. Do not replay the intent."""
 
 
 class OrderUncertain(BrokerError):
-    def __init__(self, message="Execution outcome uncertain", position_id=None, receipt=None):
-        super().__init__(message)
+    def __init__(self, message="Execution outcome uncertain", position_id=None, receipt=None, *, diagnostic=None):
+        super().__init__(message, diagnostic=diagnostic)
         self.position_id = position_id
         self.receipt = receipt or {}
 

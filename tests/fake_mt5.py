@@ -37,6 +37,11 @@ class FakeMT5:
         self.positions, self.deals = {}, {}
         self.requests, self.checks = [], []
         self.check_code, self.seq = 0, 0
+        self.check_none = False
+        self.check_error = None
+        self.send_code = None
+        self.last_error_value = (1, "Success")
+        self.last_error_reads = 0
         self.partial = self.lose_response = self.broken_protection = False
         self.fill_slippage = 0
         self.pending = ()
@@ -63,11 +68,19 @@ class FakeMT5:
         return None if self.fail_margin else 2000*volume
     def order_check(self, req):
         self.checks.append(req.copy())
+        if self.check_error is not None: raise self.check_error
+        if self.check_none: return None
         return NS(retcode=self.check_code)
+
+    def last_error(self):
+        self.last_error_reads += 1
+        return self.last_error_value
 
     def order_send(self, req):
         self.requests.append(req.copy())
         if self.fail_send: raise TimeoutError("fixture timeout")
+        if self.send_code is not None:
+            return NS(retcode=self.send_code, order=0, deal=0, volume=0., price=0.)
         self.seq += 1
         order, deal_id = 100+self.seq, 1000+self.seq
         volume = req.get("volume", 0)
