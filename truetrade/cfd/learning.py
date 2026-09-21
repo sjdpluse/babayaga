@@ -71,6 +71,10 @@ class Learning:
         last_key='cfd_last_training_end:'+stream
         inflight_key='cfd_training_inflight_end:'+stream
         last=int(self.store.meta(last_key) or 0)
+        # A live child process owns its inflight reservation. Recovery must never clear,
+        # release, or reinterpret that state while the trainer is still running.
+        if self.process and self.process.returncode is None:
+            return last
         inflight=int(self.store.meta(inflight_key) or 0)
         if inflight:
             if self._safe_to_release_unseen_attempt(inflight):
@@ -178,6 +182,8 @@ class Learning:
             'minimum_bars':50000,'minimum_span_days':180,
         }
         if all_rows:self.metrics.update(first_bar=all_rows[0]['time'],last_bar=all_rows[-1]['time'])
+        if self.process and self.process.returncode is None:
+            self.status='training_candidate_in_separate_process'
         if enabled and cfg.mode=='demo' and not self.process and len(all_rows)>=50000 and new_bars>=5000:
             if span>=180:
                 contract,feedback=calibrate(self.contract,self.store.feedback())
