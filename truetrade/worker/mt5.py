@@ -118,12 +118,12 @@ class MT5Worker:
                     self.learning=Learning(self.store,cfg,Path(self.store.path).parent/'cfd')
                 model_ready=await self.learning.service(self.client,rows,TIMEFRAMES[cfg.timeframe])
                 self.state['learning']=self.learning.status
+                self.state['learning_metrics']=self.learning.metrics
             bar = int(candles.timestamp[-1])
             self.state["last_closed_bar"] = bar
             if now - (bar+TIMEFRAMES[cfg.timeframe]) > cfg.max_bar_age:
                 self.status(False, "stale_candles_or_market_closed")
                 return
-            # Validate tradability/quote even on hold bars. Agent rechecks before send.
             market = await self.client.market(cfg.symbol)
             from truetrade.brokers.base import Quote
             Quote(**market["quote"]).validate()
@@ -157,8 +157,6 @@ class MT5Worker:
             sig = make_signal(key, side, atr, market, cfg, time.time())
             sig = replace(sig, expected_identity=identity, expected_state_id=epoch, model_sha256=model_sha,
                           expires_at=min(sig.expires_at, bar_deadline))
-            # One atomic, fully-synced write BEFORE any network submission.
-            # A crash from this point is uncertain, even if POST never left the host.
             self.store.record(key, stream, bar, "sending", signal=sig, detail="persisted_before_post")
             try:
                 result = await self.client.submit(sig)
@@ -192,8 +190,9 @@ class MT5Worker:
                 self.status(False, "agent_unavailable_or_read_failed")
         if self.learning:
             self.state["learning"]=self.learning.status
+            self.state["learning_metrics"]=self.learning.metrics
         self.last_cycle = time.time()
-        summary = {k:self.state[k] for k in ("worker", "ready", "trading", "reason", "strategy", "learning") if k in self.state}
+        summary = {k:self.state[k] for k in ("worker", "ready", "trading", "reason", "strategy", "learning", "learning_metrics") if k in self.state}
         if summary != self.previous_status:
             emit("mt5_worker_status", summary)
             self.previous_status = summary
