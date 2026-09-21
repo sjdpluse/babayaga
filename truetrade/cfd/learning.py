@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 from truetrade.cfd.contract import Contract
@@ -27,6 +28,43 @@ class Learning:
                 and meta['risk_fraction']==float(self.settings.risk)
                 and Contract(**meta['contract']).compatible(self.contract))
 
+    def _attempt_consumed(self,end_time):
+        """True only after the research ledger reserved this dataset end time."""
+        if not end_time:return False
+        ledger=self.root/'research.sqlite'
+        if not ledger.exists():return False
+        db=sqlite3.connect(ledger)
+        try:
+            table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='attempts'").fetchone()
+            if not table:return False
+            return db.execute('SELECT 1 FROM attempts WHERE end_time=?',(int(end_time),)).fetchone() is not None
+        finally:
+            db.close()
+
+    def _recover_training_markers(self,stream,candidate):
+        """Recover crashes without reusing a holdout already reserved by pipeline.py."""
+        last_key='cfd_last_training_end:'+stream
+        inflight_key='cfd_training_inflight_end:'+stream
+        last=int(self.store.meta(last_key) or 0)
+        inflight=int(self.store.meta(inflight_key) or 0)
+        if inflight:
+            consumed=self._attempt_consumed(inflight)
+            if candidate.exists() or consumed:
+                if inflight>last:
+                    self.store.set_meta(last_key,inflight);last=inflight
+                self.status=('recovered_completed_training_attempt' if candidate.exists()
+                             else 'interrupted_training_consumed_holdout_waiting_for_new_data')
+            else:
+                self.status='retrying_interrupted_training_before_holdout_reservation'
+            self.store.set_meta(inflight_key,0)
+        # Migration for the old implementation, which wrote last_training_end before
+        # subprocess creation. Reset only when no research attempt consumed that end time.
+        if (last and not candidate.exists() and not self.registry.exists() and not self.process
+                and not self._attempt_consumed(last)):
+            self.store.set_meta(last_key,0);last=0
+            self.status='recovered_legacy_prelaunch_training_marker'
+        return last
+
     async def sync_feedback(self,client):
         for key,payload in self.store.feedback_pending():
             signal=json.loads(payload)
@@ -44,7 +82,6 @@ class Learning:
             self.status='collecting_gold_history'
             self.last_profile=time.time()
         await self.sync_feedback(client)
-        # Bootstrap history a page per cycle. Merge by UTC open time; never train on a forming bar.
         offset=int(self.store.meta('cfd_history_offset:'+stream) or 1)
         if offset<=60000 and cfg.mode!='live':
             try:
@@ -56,15 +93,19 @@ class Learning:
                 self.store.set_meta('cfd_history_offset:'+stream,offset+2000)
                 offset += 2000
             except Exception:
-                # Recent valid bars still accumulate; unavailable broker history is visible.
                 self.status='historical_backfill_unavailable'
+        candidate=self.root/'latest-candidate.json'
+        inflight_key='cfd_training_inflight_end:'+stream
         if self.process and self.process.returncode is not None:
             if self.joblog:self.joblog.close();self.joblog=None
-            success=self.process.returncode==0;self.process=None
-            if not success:self.status='training_failed_inspect_training_log'
-        # Recover a completely saved candidate even if the worker restarted after training.
-        # A failed/partial job has no qualifying manifest and cannot replace active weights.
-        candidate=self.root/'latest-candidate.json'
+            success=self.process.returncode==0
+            inflight=int(self.store.meta(inflight_key) or 0)
+            if inflight and (success or self._attempt_consumed(inflight)):
+                self.store.set_meta('cfd_last_training_end:'+stream,inflight)
+            self.store.set_meta(inflight_key,0)
+            self.process=None
+            self.status=('training_process_completed' if success else 'training_failed_inspect_training_log')
+        last_trained=self._recover_training_markers(stream,candidate)
         if cfg.mode=='demo' and candidate.exists():
             record=json.loads(candidate.read_text())
             fingerprint=record['manifest_sha256']
@@ -81,45 +122,45 @@ class Learning:
         if self.registry.exists():
             model,norm,meta,record=load_release(self.registry,mode=cfg.mode)
             if self.compatible(meta,seconds):
-                # Freeze learned weights during execution; loading never updates them.
                 self.policy=(model,norm,meta)
                 self.status='qualified_model_loaded'
             else:
-                # Halt entries, but continue collecting data and training a new candidate.
                 self.status='model_contract_changed_requalification_required'
         all_rows=self.store.bars(stream)
-        last_trained=int(self.store.meta('cfd_last_training_end:'+stream) or 0)
+        last_trained=int(self.store.meta('cfd_last_training_end:'+stream) or last_trained or 0)
         new_bars=sum(r['time']>last_trained for r in all_rows)
         span=((all_rows[-1]['time']-all_rows[0]['time'])/86400) if len(all_rows)>=2 else 0.0
         enabled=os.getenv('CFD_AUTO_TRAIN','true').lower()=='true'
+        inflight=int(self.store.meta(inflight_key) or 0)
         self.metrics={
-            'stream':stream,
-            'bar_count':len(all_rows),
-            'span_days':round(span,2),
-            'history_offset':offset,
-            'history_limit':60000,
-            'new_bars_since_last_training':new_bars,
-            'last_training_end':last_trained,
-            'auto_train_enabled':enabled,
+            'stream':stream,'bar_count':len(all_rows),'span_days':round(span,2),
+            'history_offset':offset,'history_limit':60000,
+            'new_bars_since_last_training':new_bars,'last_training_end':last_trained,
+            'training_inflight_end':inflight,'auto_train_enabled':enabled,
             'training_process_running':bool(self.process and self.process.returncode is None),
-            'minimum_bars':50000,
-            'minimum_span_days':180,
+            'minimum_bars':50000,'minimum_span_days':180,
         }
-        if all_rows:
-            self.metrics.update(first_bar=all_rows[0]['time'],last_bar=all_rows[-1]['time'])
+        if all_rows:self.metrics.update(first_bar=all_rows[0]['time'],last_bar=all_rows[-1]['time'])
         if enabled and cfg.mode=='demo' and not self.process and len(all_rows)>=50000 and new_bars>=5000:
             if span>=180:
                 contract,feedback=calibrate(self.contract,self.store.feedback())
-                dataset=self.root/('dataset-'+str(all_rows[-1]['time'])+'.json')
+                end_time=all_rows[-1]['time']
+                dataset=self.root/('dataset-'+str(end_time)+'.json')
                 atomic_json(dataset,{'rows':all_rows,'seconds':seconds,'contract':contract.json(),
                                      'captured_at':time.time(),'feedback_calibration':feedback})
-                self.store.set_meta('cfd_last_training_end:'+stream,all_rows[-1]['time'])
+                self.store.set_meta(inflight_key,end_time)
                 self.joblog=(self.root/'training.log').open('ab')
-                self.process=await asyncio.create_subprocess_exec(sys.executable,'-m','truetrade.cfd.pipeline',
-                    str(dataset),str(self.root),'--episodes',os.getenv('CFD_TRAIN_EPISODES','2000'),
-                    stdout=self.joblog,stderr=self.joblog)
+                try:
+                    self.process=await asyncio.create_subprocess_exec(sys.executable,'-m','truetrade.cfd.pipeline',
+                        str(dataset),str(self.root),'--episodes',os.getenv('CFD_TRAIN_EPISODES','2000'),
+                        stdout=self.joblog,stderr=self.joblog)
+                except BaseException:
+                    self.store.set_meta(inflight_key,0)
+                    self.joblog.close();self.joblog=None
+                    raise
                 self.status='training_candidate_in_separate_process'
                 self.metrics['training_process_running']=True
+                self.metrics['training_inflight_end']=end_time
         if self.policy is None and not self.process and self.status in {'waiting_for_market_data','collecting_gold_history'}:
             self.status='waiting_for_50000_bars_and_180_days'
         self.store.set_meta('cfd_learning_status',self.status)
