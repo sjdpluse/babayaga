@@ -29,7 +29,6 @@ class Learning:
                 and Contract(**meta['contract']).compatible(self.contract))
 
     def _attempt_consumed(self,end_time):
-        """True only after the research ledger reserved this dataset end time."""
         if not end_time:return False
         ledger=self.root/'research.sqlite'
         if not ledger.exists():return False
@@ -41,15 +40,43 @@ class Learning:
         finally:
             db.close()
 
+    def _release_attempt(self,end_time):
+        ledger=self.root/'research.sqlite'
+        if not ledger.exists():return
+        db=sqlite3.connect(ledger)
+        try:
+            table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='attempts'").fetchone()
+            if table:
+                with db:
+                    db.execute('DELETE FROM attempts WHERE end_time=?',(int(end_time),))
+        finally:
+            db.close()
+
+    def _safe_to_release_unseen_attempt(self,end_time):
+        """Release only an interrupted reservation that cannot have evaluated holdout data.
+
+        pipeline.py writes a flushed training_fold_completed line after every chronological
+        fold and evaluates the holdout only after all three folds. A zero-byte log therefore
+        proves no fold completed and the holdout could not have been evaluated.
+        """
+        if not end_time or not self._attempt_consumed(end_time):return False
+        if self.registry.exists() or (self.root/'latest-candidate.json').exists():return False
+        log=self.root/'training.log'
+        if not log.exists() or log.stat().st_size!=0:return False
+        if not (self.root/('dataset-'+str(int(end_time))+'.json')).exists():return False
+        return not any(self.root.glob('model-*'))
+
     def _recover_training_markers(self,stream,candidate):
-        """Recover crashes without reusing a holdout already reserved by pipeline.py."""
+        """Recover crashes without reusing any holdout that may have been evaluated."""
         last_key='cfd_last_training_end:'+stream
         inflight_key='cfd_training_inflight_end:'+stream
         last=int(self.store.meta(last_key) or 0)
         inflight=int(self.store.meta(inflight_key) or 0)
         if inflight:
-            consumed=self._attempt_consumed(inflight)
-            if candidate.exists() or consumed:
+            if self._safe_to_release_unseen_attempt(inflight):
+                self._release_attempt(inflight)
+                self.status='retrying_interrupted_training_before_any_fold_completed'
+            elif candidate.exists() or self._attempt_consumed(inflight):
                 if inflight>last:
                     self.store.set_meta(last_key,inflight);last=inflight
                 self.status=('recovered_completed_training_attempt' if candidate.exists()
@@ -57,12 +84,17 @@ class Learning:
             else:
                 self.status='retrying_interrupted_training_before_holdout_reservation'
             self.store.set_meta(inflight_key,0)
-        # Migration for the old implementation, which wrote last_training_end before
-        # subprocess creation. Reset only when no research attempt consumed that end time.
-        if (last and not candidate.exists() and not self.registry.exists() and not self.process
-                and not self._attempt_consumed(last)):
-            self.store.set_meta(last_key,0);last=0
-            self.status='recovered_legacy_prelaunch_training_marker'
+        # Legacy worker wrote last_training_end before subprocess creation. If that
+        # reservation never completed even one fold, it is statistically unseen and safe
+        # to release. Otherwise retain it and require genuinely new holdout data.
+        if last and not candidate.exists() and not self.registry.exists() and not self.process:
+            if self._safe_to_release_unseen_attempt(last):
+                self._release_attempt(last)
+                self.store.set_meta(last_key,0);last=0
+                self.status='released_legacy_unseen_training_reservation'
+            elif not self._attempt_consumed(last):
+                self.store.set_meta(last_key,0);last=0
+                self.status='recovered_legacy_prelaunch_training_marker'
         return last
 
     async def sync_feedback(self,client):
@@ -100,8 +132,13 @@ class Learning:
             if self.joblog:self.joblog.close();self.joblog=None
             success=self.process.returncode==0
             inflight=int(self.store.meta(inflight_key) or 0)
-            if inflight and (success or self._attempt_consumed(inflight)):
-                self.store.set_meta('cfd_last_training_end:'+stream,inflight)
+            if inflight:
+                if success:
+                    self.store.set_meta('cfd_last_training_end:'+stream,inflight)
+                elif self._safe_to_release_unseen_attempt(inflight):
+                    self._release_attempt(inflight)
+                elif self._attempt_consumed(inflight):
+                    self.store.set_meta('cfd_last_training_end:'+stream,inflight)
             self.store.set_meta(inflight_key,0)
             self.process=None
             self.status=('training_process_completed' if success else 'training_failed_inspect_training_log')
