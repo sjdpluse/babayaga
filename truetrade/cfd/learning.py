@@ -20,6 +20,7 @@ class Learning:
         self.status='waiting_for_market_data';self.policy=None
         self.registry=Path(os.getenv('CFD_MODEL_REGISTRY',str(self.root/'active.json')))
         self.last_profile=0
+        self.metrics={}
 
     def compatible(self,meta,seconds):
         return (meta['canonical_symbol']==self.settings.symbol and meta['seconds']==seconds
@@ -53,6 +54,7 @@ class Learning:
                 closed_candles(page,SimpleNamespace(bars=2000,timeframe=cfg.timeframe),time.time())
                 self.store.capture(stream,page)
                 self.store.set_meta('cfd_history_offset:'+stream,offset+2000)
+                offset += 2000
             except Exception:
                 # Recent valid bars still accumulate; unavailable broker history is visible.
                 self.status='historical_backfill_unavailable'
@@ -88,9 +90,24 @@ class Learning:
         all_rows=self.store.bars(stream)
         last_trained=int(self.store.meta('cfd_last_training_end:'+stream) or 0)
         new_bars=sum(r['time']>last_trained for r in all_rows)
+        span=((all_rows[-1]['time']-all_rows[0]['time'])/86400) if len(all_rows)>=2 else 0.0
         enabled=os.getenv('CFD_AUTO_TRAIN','true').lower()=='true'
+        self.metrics={
+            'stream':stream,
+            'bar_count':len(all_rows),
+            'span_days':round(span,2),
+            'history_offset':offset,
+            'history_limit':60000,
+            'new_bars_since_last_training':new_bars,
+            'last_training_end':last_trained,
+            'auto_train_enabled':enabled,
+            'training_process_running':bool(self.process and self.process.returncode is None),
+            'minimum_bars':50000,
+            'minimum_span_days':180,
+        }
+        if all_rows:
+            self.metrics.update(first_bar=all_rows[0]['time'],last_bar=all_rows[-1]['time'])
         if enabled and cfg.mode=='demo' and not self.process and len(all_rows)>=50000 and new_bars>=5000:
-            span=(all_rows[-1]['time']-all_rows[0]['time'])/86400
             if span>=180:
                 contract,feedback=calibrate(self.contract,self.store.feedback())
                 dataset=self.root/('dataset-'+str(all_rows[-1]['time'])+'.json')
@@ -102,6 +119,7 @@ class Learning:
                     str(dataset),str(self.root),'--episodes',os.getenv('CFD_TRAIN_EPISODES','2000'),
                     stdout=self.joblog,stderr=self.joblog)
                 self.status='training_candidate_in_separate_process'
+                self.metrics['training_process_running']=True
         if self.policy is None and not self.process and self.status in {'waiting_for_market_data','collecting_gold_history'}:
             self.status='waiting_for_50000_bars_and_180_days'
         self.store.set_meta('cfd_learning_status',self.status)
