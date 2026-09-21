@@ -237,11 +237,13 @@ class RealContractMockTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.server.close();await self.server.wait_closed();self.store.close();self.journal.close();self.tmp.cleanup()
 
-    async def test_history_ticket_parameter_is_order_not_deal(self):
+    async def test_history_ticket_parameter_is_deal_not_order(self):
         sig=signal();await self.engine.submit(sig)
         receipt=next(iter(self.api.deals.values()))
-        self.assertEqual(len(self.api.history_deals_get(ticket=receipt.order)),1)
-        self.assertEqual(len(self.api.history_deals_get(ticket=receipt.ticket)),0)
+        self.assertEqual(len(self.api.history_deals_get(ticket=receipt.order)),0)
+        self.assertEqual(len(self.api.history_deals_get(ticket=receipt.ticket)),1)
+        self.assertEqual(len(self.api.history_orders_get(ticket=receipt.order)),1)
+        self.assertEqual(len(self.api.history_deals_get(position=receipt.position_id)),1)
 
     async def test_research_contract_needs_reviewed_costs(self):
         with patch.dict('os.environ',{},clear=True):

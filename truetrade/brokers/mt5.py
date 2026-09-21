@@ -68,7 +68,11 @@ class MT5Broker:
 
     def call(self, method, *args, **kwargs):
         try:
-            value = getattr(self.api, method)(*args, **kwargs)
+            func = getattr(self.api, method)
+            # MetaTrader5's native extension rejects some positional-only calls
+            # when an empty keyword mapping is expanded with **{}.
+            # Do not pass keyword arguments unless at least one actually exists.
+            value = func(*args, **kwargs) if kwargs else func(*args)
         except Exception:
             raise self._call_failure(method, "failed") from None
         if value is None:
@@ -383,16 +387,32 @@ class MT5Broker:
         try:
             if not result.order or not result.deal:
                 raise ValueError()
-            deals = [d for d in self.call("history_deals_get", ticket=int(result.order))
+            expected = self.api.DEAL_TYPE_BUY if plan.side == "LONG" else self.api.DEAL_TYPE_SELL
+
+            # result.order is an order ticket, not a deal ticket or position id.
+            # Resolve the filled order first, then use its position_id for deal history.
+            orders = [o for o in self.call("history_orders_get", ticket=int(result.order))
+                      if o.ticket == result.order]
+            if len(orders) != 1:
+                raise ValueError()
+            order = orders[0]
+            position_identifier = int(order.position_id)
+            if (position_identifier <= 0 or order.symbol != plan.symbol or
+                    order.magic != self.settings.magic or order.type != expected or
+                    position_identifier in before):
+                raise ValueError()
+
+            deals = [d for d in self.call("history_deals_get", position=position_identifier)
                      if d.ticket == result.deal]
             if len(deals) != 1:
                 raise ValueError()
             deal = deals[0]
-            expected = self.api.DEAL_TYPE_BUY if plan.side == "LONG" else self.api.DEAL_TYPE_SELL
-            if (deal.order != result.order or deal.symbol != plan.symbol or deal.magic != self.settings.magic or
-                    deal.type != expected or deal.entry != self.api.DEAL_ENTRY_IN or deal.position_id in before):
+            if (deal.order != result.order or deal.position_id != position_identifier or
+                    deal.symbol != plan.symbol or deal.magic != self.settings.magic or
+                    deal.type != expected or deal.entry != self.api.DEAL_ENTRY_IN):
                 raise ValueError()
-            matches = [p for p in self._positions() if p.identifier == deal.position_id
+
+            matches = [p for p in self._positions() if p.identifier == position_identifier
                        and p.symbol == plan.symbol and p.magic == self.settings.magic]
             if len(matches) != 1:
                 raise ValueError()

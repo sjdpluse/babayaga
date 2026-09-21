@@ -34,7 +34,7 @@ class FakeMT5:
         self.names = ["XAUUSD"]
         self.bid, self.ask = 2000., 2000.2
         self.tick_age = 0
-        self.positions, self.deals = {}, {}
+        self.positions, self.deals, self.orders = {}, {}, {}
         self.requests, self.checks = [], []
         self.check_code, self.seq = 0, 0
         self.check_none = False
@@ -91,13 +91,15 @@ class FakeMT5:
         if "position" in req:
             p = self.positions.pop(req["position"])
             price = self.bid if req["type"] == 1 else self.ask
-            self.deals[deal_id] = NS(ticket=deal_id, order=order, position_id=p.identifier,
+            position_identifier = p.identifier
+            self.deals[deal_id] = NS(ticket=deal_id, order=order, position_id=position_identifier,
                 symbol=p.symbol, magic=req["magic"], type=req["type"], entry=1, volume=volume, price=price)
             self.account_value.margin = round(self.account_value.margin-volume*2000, 8)
         else:
             if self.partial: volume /= 2
             price = (self.ask if req["type"] == 0 else self.bid) + self.fill_slippage
             ticket, identifier = 20000+order, 30000+order
+            position_identifier = identifier
             self.positions[ticket] = NS(ticket=ticket, identifier=identifier, symbol=req["symbol"],
                 type=req["type"], volume=volume, price_open=price,
                 sl=0 if self.broken_protection else req["sl"],
@@ -105,12 +107,26 @@ class FakeMT5:
             self.deals[deal_id] = NS(ticket=deal_id, order=order, position_id=identifier,
                 symbol=req["symbol"], magic=req["magic"], type=req["type"], entry=0, volume=volume, price=price)
             self.account_value.margin += volume*2000
+
+        self.orders[order] = NS(
+            ticket=order,
+            position_id=position_identifier,
+            symbol=req["symbol"],
+            magic=req["magic"],
+            type=req["type"],
+        )
         if self.lose_response: return None
         return NS(retcode=10010 if self.partial and "position" not in req else 10009,
                   deal=deal_id, order=order, volume=volume, price=price)
 
+    def history_orders_get(self, ticket=None, position=None):
+        return tuple(o for o in self.orders.values()
+                     if (ticket is None or o.ticket == ticket)
+                     and (position is None or o.position_id == position))
+
     def history_deals_get(self, ticket=None, position=None):
-        return tuple(d for d in self.deals.values() if (ticket is None or d.order == ticket)
+        return tuple(d for d in self.deals.values()
+                     if (ticket is None or d.ticket == ticket)
                      and (position is None or d.position_id == position))
 
     def copy_rates_from_pos(self, symbol, timeframe, start, count):
